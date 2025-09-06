@@ -13,6 +13,39 @@ CACHE_FILE="$CACHE_DIR/ipinfo.tsv"
 mkdir -p "$CACHE_DIR"
 touch "$CACHE_FILE"
 
+# Usage helper
+usage() {
+  cat <<'EOF'
+busy_clients [--list [DAYS]] [DAYS]
+
+Without flags, prints a formatted table of IPs with totals, disallowed counts, city,country, and hostname.
+--list prints a machine-friendly list with the same columns in a single line per IP.
+If DAYS is omitted, defaults to 7.
+EOF
+}
+
+# Mode and days parsing
+MODE="table"
+DAYS_BACK=""
+case "$1" in
+  --help|-h)
+    usage
+    exit 0
+    ;;
+  --list)
+    MODE="list"
+    if [[ -n "$2" ]]; then
+      DAYS_BACK="$2"
+    fi
+    ;;
+  *)
+    if [[ -n "$1" ]]; then
+      DAYS_BACK="$1"
+    fi
+    ;;
+esac
+DAYS_BACK="${DAYS_BACK:-7}"
+
 # Check that required files exist
 if [ ! -f "$ROBOTS_FILE" ]; then
   echo "Error: robots.txt not found at $ROBOTS_FILE"
@@ -23,9 +56,6 @@ if [ ! -f "$ACCESS_LOG" ]; then
   echo "Error: Access log not found at $ACCESS_LOG"
   exit 1
 fi
-
-# If a parameter is provided, use it for the number of days, otherwise default to 7
-DAYS_BACK=${1:-7}
 
 # Extract disallowed paths
 DISALLOWED_PATHS=$(grep -i '^[[:space:]]*Disallow:' "$ROBOTS_FILE" \
@@ -60,7 +90,6 @@ grep -E "$DATE_PATTERN" "$ACCESS_LOG" > "$TEMP_ALL"
 # Collect only the lines that hit disallowed paths
 : > "$TEMP_VIOL"
 if [ -n "$DISALLOWED_PATHS" ]; then
-  # Match on the request line. This follows the original approach and looks for "GET /path"
   for path in $DISALLOWED_PATHS; do
     grep "\"GET ${path}" "$TEMP_ALL" >> "$TEMP_VIOL"
   done
@@ -91,7 +120,6 @@ awk '
 # Lookup helper: returns "City, CC" or "(unknown)"
 lookup_geo() {
   local ip="$1"
-  # Check cache
   local cached
   cached=$(awk -v ip="$ip" -F'\t' '$1==ip {print $2}' "$CACHE_FILE" | head -n1)
   if [ -n "$cached" ]; then
@@ -99,61 +127,70 @@ lookup_geo() {
     return 0
   fi
 
-  # Build URL
   local url="https://ipinfo.io/${ip}"
   if [ -n "$IPINFO_TOKEN" ]; then
     url="${url}?token=${IPINFO_TOKEN}"
   fi
 
-  # Query with short timeout and basic retry
   local resp
   resp=$(curl -m 4 --retry 1 --retry-delay 1 -sS "$url") || resp=""
 
-  # Parse JSON for city and country
   local city country
   if command -v jq >/dev/null 2>&1; then
     city=$(printf '%s' "$resp" | jq -r '.city // empty')
     country=$(printf '%s' "$resp" | jq -r '.country // empty')
   else
-    # Fallback parser for simple key extraction
     city=$(printf '%s' "$resp" | tr -d '\r' | grep -o '"city":[[:space:]]*"[^"]*"'    | head -1 | sed 's/.*"city":[[:space:]]*"\([^"]*\)".*/\1/')
     country=$(printf '%s' "$resp" | tr -d '\r' | grep -o '"country":[[:space:]]*"[^"]*"' | head -1 | sed 's/.*"country":[[:space:]]*"\([^"]*\)".*/\1/')
   fi
 
   local out
-  if [ -n "$city" ] || [ -n "$country" ]; then
-    if [ -n "$city" ] && [ -n "$country" ]; then
-      out="${city}, ${country}"
-    elif [ -n "$country" ]; then
-      out="${country}"
-    else
-      out="${city}"
-    fi
+  if [ -n "$city" ] && [ -n "$country" ]; then
+    out="${city}, ${country}"
+  elif [ -n "$country" ]; then
+    out="${country}"
+  elif [ -n "$city" ]; then
+    out="${city}"
   else
     out="(unknown)"
   fi
 
-  # Cache result
   printf "%s\t%s\n" "$ip" "$out" >> "$CACHE_FILE"
   printf "%s" "$out"
 }
 
+# Hostname helper
+lookup_host() {
+  local ip="$1"
+  local h
+  h=$(host "$ip" 2>/dev/null | awk "/domain name pointer/ {print \$5}" | sed 's/\.$//')
+  [ -z "$h" ] && h="(unresolved)"
+  printf "%s" "$h"
+}
+
 # Output
+if [ "$MODE" = "list" ]; then
+  # Machine friendly list, one line per IP, includes city,country
+  # Columns: ip total disallowed city,country hostname
+  sort -k2,2nr -k1,1 "$MERGED" | while read -r ip total disallowed; do
+    geo="$(lookup_geo "$ip")"
+    hostn="$(lookup_host "$ip")"
+    printf "%s\t%s\t%s\t%s\t%s\n" "$ip" "$total" "$disallowed" "$geo" "$hostn"
+  done
+  exit 0
+fi
+
 echo
 echo "=== Clients in the past $DAYS_BACK days (total vs disallowed) ==="
-# Use wider IP column for IPv6
 printf "%-39s %7s %11s   %-24s %s\n" "IP" "total" "disallowed" "city,country" "hostname"
 printf "%-39s %7s %11s   %-24s %s\n" "---------------------------------------" "------" "-----------" "------------" "--------"
 
-# Sort by total requests descending, then IP
 sort -k2,2nr -k1,1 "$MERGED" | while read -r ip total disallowed; do
-  hostname=$(host "$ip" 2>/dev/null | awk "/domain name pointer/ {print \$5}" | sed 's/\.$//')
-  [ -z "$hostname" ] && hostname="(unresolved)"
+  hostname="$(lookup_host "$ip")"
   geo="$(lookup_geo "$ip")"
   printf "%-39s %7s %11s   %-24s %s\n" "$ip" "$total" "$disallowed" "$geo" "$hostname"
 done
 
-# Summary
 echo
 echo "Total unique IPs: $(awk '{print $2}' "$TOT_COUNTS" | wc -l)"
 if [ -s "$VIO_COUNTS" ]; then
