@@ -1,0 +1,51 @@
+#!/bin/bash
+
+# Set paths
+ROBOTS_FILE="/opt/bitnami/wordpress/robots.txt"
+ACCESS_LOG="/opt/bitnami/apache2/logs/access_log"
+
+# Check that required files exist
+if [ ! -f "$ROBOTS_FILE" ]; then
+  echo "Error: robots.txt not found at $ROBOTS_FILE"
+  exit 1
+fi
+
+if [ ! -f "$ACCESS_LOG" ]; then
+  echo "Error: Access log not found at $ACCESS_LOG"
+  exit 1
+fi
+
+# If a parameter is provided, use it for the number of days; otherwise default to 7
+DAYS_BACK=${1:-7}
+
+# Extract disallowed paths
+DISALLOWED_PATHS=$(grep -i '^Disallow:' "$ROBOTS_FILE" | awk '{print $2}' | sed 's|/$||' | sort -u)
+
+# Collect relevant log lines for the last $DAYS_BACK days
+TEMP_LOG=$(mktemp)
+for path in $DISALLOWED_PATHS; do
+  echo "Scanning for disallowed path: $path"
+  # Loop from 0..(DAYS_BACK-1) to include all days in the range
+  for i in $(seq 0 $((DAYS_BACK-1))); do
+    day_string=$(date -d "$i days ago" "+%d/%b/%Y")
+    grep "\"GET ${path}" "$ACCESS_LOG" | grep "$day_string"
+  done >> "$TEMP_LOG"
+done
+
+# Count IP accesses and output in requested format
+echo
+echo "=== IP addresses accessing disallowed paths in the past $DAYS_BACK days ==="
+
+awk '{print $1}' "$TEMP_LOG" | sort | uniq -c | sort -nr | while read -r count ip; do
+  hostname=$(host "$ip" 2>/dev/null | awk '/domain name pointer/ {print $5}' | sed 's/\.$//')
+  [ -z "$hostname" ] && hostname="(unresolved)"
+  printf "%-15s %5s   %s\n" "$ip" "$count" "$hostname"
+done
+
+# Summary
+echo
+echo "Total unique IPs: $(awk '{print $1}' "$TEMP_LOG" | sort -u | wc -l)"
+
+# Cleanup
+rm -f "$TEMP_LOG"
+

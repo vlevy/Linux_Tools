@@ -1,0 +1,104 @@
+#!/bin/bash
+
+# Set paths
+ROBOTS_FILE="/opt/bitnami/wordpress/robots.txt"
+ACCESS_LOG="/opt/bitnami/apache2/logs/access_log"
+
+# Check that required files exist
+if [ ! -f "$ROBOTS_FILE" ]; then
+  echo "Error: robots.txt not found at $ROBOTS_FILE"
+  exit 1
+fi
+
+if [ ! -f "$ACCESS_LOG" ]; then
+  echo "Error: Access log not found at $ACCESS_LOG"
+  exit 1
+fi
+
+# If a parameter is provided, use it for the number of days; otherwise default to 7
+DAYS_BACK=${1:-7}
+
+# Extract disallowed paths
+DISALLOWED_PATHS=$(grep -i '^[[:space:]]*Disallow:' "$ROBOTS_FILE" \
+  | awk '{print $2}' \
+  | sed 's|/$||' \
+  | sed '/^$/d' \
+  | sort -u)
+
+# Build a single regex for the last N days like 26/Aug/2025|25/Aug/2025|...
+DATE_PATTERN=$(
+  for i in $(seq 0 $((DAYS_BACK-1))); do
+    date -d "$i days ago" "+%d/%b/%Y"
+  done | paste -sd'|' -
+)
+
+# Temp files
+TEMP_ALL=$(mktemp)
+TEMP_VIOL=$(mktemp)
+TOT_COUNTS=$(mktemp)
+VIO_COUNTS=$(mktemp)
+MERGED=$(mktemp)
+
+# Ensure cleanup
+cleanup() {
+  rm -f "$TEMP_ALL" "$TEMP_VIOL" "$TOT_COUNTS" "$VIO_COUNTS" "$MERGED"
+}
+trap cleanup EXIT
+
+# Collect all access log lines for the last N days
+grep -E "$DATE_PATTERN" "$ACCESS_LOG" > "$TEMP_ALL"
+
+# Collect only the lines that hit disallowed paths
+: > "$TEMP_VIOL"
+if [ -n "$DISALLOWED_PATHS" ]; then
+  # Match on the request line. This follows the original approach and looks for "GET /path"
+  for path in $DISALLOWED_PATHS; do
+    grep "\"GET ${path}" "$TEMP_ALL" >> "$TEMP_VIOL"
+  done
+fi
+
+# Count total requests per IP
+awk '{print $1}' "$TEMP_ALL" | sort | uniq -c > "$TOT_COUNTS"
+
+# Count disallowed requests per IP
+if [ -s "$TEMP_VIOL" ]; then
+  awk '{print $1}' "$TEMP_VIOL" | sort | uniq -c > "$VIO_COUNTS"
+else
+  : > "$VIO_COUNTS"
+fi
+
+# Merge counts so that all clients appear, even if they have zero disallowed hits
+awk '
+  NR==FNR { tot[$2]=$1; next }
+  { viol[$2]=$1; next }
+  END {
+    for (ip in tot) {
+      v = (ip in viol) ? viol[ip] : 0
+      printf "%s %d %d\n", ip, tot[ip], v
+    }
+  }
+' "$TOT_COUNTS" "$VIO_COUNTS" > "$MERGED"
+
+# Output
+echo
+echo "=== Clients in the past $DAYS_BACK days (total vs disallowed) ==="
+# Use wider IP column for IPv6
+printf "%-39s %7s %11s   %s\n" "IP" "total" "disallowed" "hostname"
+printf "%-39s %7s %11s   %s\n" "---------------------------------------" "------" "-----------" "--------"
+
+# Sort by total requests descending, then IP
+sort -k2,2nr -k1,1 "$MERGED" | while read -r ip total disallowed; do
+  hostname=$(host "$ip" 2>/dev/null | awk "/domain name pointer/ {print \$5}" | sed 's/\.$//')
+  [ -z "$hostname" ] && hostname="(unresolved)"
+  printf "%-39s %7s %11s   %s\n" "$ip" "$total" "$disallowed" "$hostname"
+done
+
+# Summary
+echo
+echo "Total unique IPs: $(awk '{print $2}' "$TOT_COUNTS" | wc -l)"
+if [ -s "$VIO_COUNTS" ]; then
+  echo "Unique IPs with disallowed accesses: $(awk '{print $2}' "$VIO_COUNTS" | wc -l)"
+else
+  echo "Unique IPs with disallowed accesses: 0"
+fi
+

@@ -1,0 +1,425 @@
+#!/bin/bash
+# Block an IP or CIDR unless it overlaps official Googlebot prefixes.
+# List current blocks, unblock ranges, and autoblock high-rate offenders.
+# Requires: curl, python3, iptables/ip6tables. Uses netfilter-persistent if present.
+
+set -euo pipefail
+
+USAGE=$'Usage:\n'\
+"  $0 <IP or CIDR>                  Block the address range unless it overlaps Googlebot\n"\
+"  $0 --list [4|6]                  List DROP rules on INPUT with a source address\n"\
+"  $0 --unblock <CIDR...>           Remove one or more blocked ranges\n"\
+"  $0 --autoblock <minutes> <N>     Block IPs with >= N requests in the last <minutes>\n"\
+"       [--dry-run] [--log <path>]\n"\
+$'\nExamples:\n'\
+"  $0 203.0.113.0/24\n"\
+"  $0 --list\n"\
+"  $0 --unblock 34.174.0.0/16 47.82.11.0/24\n"\
+"  $0 --autoblock 10 300 --dry-run\n"
+
+# Defaults
+ACCESS_LOG_DEFAULT="/opt/bitnami/apache2/logs/access_log"
+ALLOWLIST_FILE="${ALLOWLIST_FILE:-/etc/block_ip.allow}"
+
+MODE="block"
+FAMILY_LIST="all"
+CHANGED=0
+
+ARG1="${1:-}"
+ARG2="${2:-}"
+
+if [ "${ARG1:-}" = "--list" ] || [ "${ARG1:-}" = "-l" ]; then
+  MODE="list"
+  case "${ARG2:-all}" in
+    4|v4|ipv4) FAMILY_LIST="4" ;;
+    6|v6|ipv6) FAMILY_LIST="6" ;;
+    all|"") FAMILY_LIST="all" ;;
+    *) echo "$USAGE" >&2; exit 1 ;;
+  esac
+elif [ "${ARG1:-}" = "--unblock" ] || [ "${ARG1:-}" = "-u" ]; then
+  MODE="unblock"
+  shift
+  [ "$#" -ge 1 ] || { echo "$USAGE" >&2; exit 1; }
+elif [ "${ARG1:-}" = "--autoblock" ]; then
+  MODE="autoblock"
+  shift
+  [ "$#" -ge 2 ] || { echo "$USAGE" >&2; exit 1; }
+  AB_MINUTES="$1"; AB_THRESHOLD="$2"; shift 2
+  AB_DRY_RUN=0
+  ACCESS_LOG="$ACCESS_LOG_DEFAULT"
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --dry-run) AB_DRY_RUN=1 ;;
+      --log) shift; ACCESS_LOG="${1:-}"; [ -n "$ACCESS_LOG" ] || { echo "Error: --log requires a path" >&2; exit 1; } ;;
+      *) echo "Error: unknown flag for --autoblock: $1" >&2; echo "$USAGE" >&2; exit 1 ;;
+    esac
+    shift || true
+  done
+fi
+
+# Resolve a binary even if not on PATH, trying common sbin locations
+find_cmd() {
+  local name="$1"
+  local c
+  for c in "$name" "/usr/sbin/$name" "/sbin/$name"; do
+    if [ -x "$c" ]; then
+      echo "$c"
+      return 0
+    fi
+  done
+  return 1
+}
+
+# Reverse DNS for a single IP, returns "(unresolved)" on failure
+ptr_name() {
+  local ip="$1" name=""
+  if command -v host >/dev/null 2>&1; then
+    name=$(host "$ip" 2>/dev/null | awk '/domain name pointer/ {print $5}' | sed 's/\.$//' | head -n1)
+  fi
+  if [ -z "$name" ] && command -v getent >/dev/null 2>&1; then
+    name=$(getent hosts "$ip" 2>/dev/null | awk '{print $2}' | head -n1)
+  fi
+  if [ -z "$name" ] && command -v dig >/dev/null 2>&1; then
+    name=$(dig +short -x "$ip" 2>/dev/null | sed 's/\.$//' | head -n1)
+  fi
+  [ -z "$name" ] && name="(unresolved)"
+  printf '%s' "$name"
+}
+
+# Return 0 if an IP is allowlisted by CIDR or rDNS glob in $ALLOWLIST_FILE
+is_allowlisted_ip() {
+  local ip="$1" host pat
+  [ -f "$ALLOWLIST_FILE" ] || return 1
+  host=$(ptr_name "$ip")
+  while IFS= read -r pat; do
+    pat="${pat%%#*}"
+    pat="${pat%"${pat##*[![:space:]]}"}"
+    [ -z "$pat" ] && continue
+    if [[ "$pat" == */* ]]; then
+      python3 - "$ip" "$pat" <<'PY'
+import sys, ipaddress
+ip = ipaddress.ip_address(sys.argv[1])
+net = ipaddress.ip_network(sys.argv[2], strict=False)
+sys.exit(0 if ip in net else 1)
+PY
+      [ $? -eq 0 ] && return 0
+    else
+      case "$host" in
+        $pat) return 0 ;;
+      esac
+    fi
+  done < "$ALLOWLIST_FILE"
+  return 1
+}
+
+# List currently blocked source CIDRs on INPUT for the given family
+list_family() {
+  local base="$1"
+  local label="$2"
+  local cmd run width
+
+  echo "$label"
+
+  if ! cmd="$(find_cmd "$base")"; then
+    echo "  ($base not found, ensure /usr/sbin and /sbin are in PATH)"
+    return 0
+  fi
+
+  if [ "${EUID:-$(id -u)}" -ne 0 ] && command -v sudo >/dev/null 2>&1; then
+    run=(sudo -n "$cmd")
+  else
+    run=("$cmd")
+  fi
+
+  local lines
+  lines=$(
+    "${run[@]}" -S INPUT 2>/dev/null \
+      | awk '
+          $1=="-A" && $2=="INPUT" {
+            src=""; drop=0
+            for (i=3; i<=NF; i++) {
+              if ($i=="-s" && i+1<=NF) src=$(i+1)
+              if ($i=="-j" && i+1<=NF && $(i+1)=="DROP") drop=1
+            }
+            if (drop && src!="") print src
+          }
+        ' \
+      | sort -u || true
+  )
+
+  width=22
+  [ "$base" = "ip6tables" ] && width=46
+
+  if [ -n "${lines:-}" ]; then
+    local count=0
+    while IFS= read -r cidr; do
+      [ -z "$cidr" ] && continue
+      local hostcol=""
+      if [ "$base" = "iptables" ] && [[ "$cidr" == */32 ]]; then
+        hostcol=$(ptr_name "${cidr%/*}")
+      fi
+      printf "  %-*s   %s\n" "$width" "$cidr" "$hostcol"
+      count=$((count+1))
+    done <<< "$lines"
+    echo "  -- total: $count"
+  else
+    if "${run[@]}" -L INPUT -n 1>/dev/null 2>&1; then
+      echo "  (none)"
+    else
+      echo "  (cannot read rules, try running with sudo)"
+    fi
+  fi
+}
+
+list_blocked() {
+  if [ "$FAMILY_LIST" = "4" ] || [ "$FAMILY_LIST" = "all" ]; then
+    list_family iptables "IPv4:"
+  fi
+  if [ "$FAMILY_LIST" = "6" ] || [ "$FAMILY_LIST" = "all" ]; then
+    list_family ip6tables "IPv6:"
+  fi
+}
+
+# Normalize an address to CIDR and return "CIDR FAMILY"
+normalize_cidr() {
+  python3 - "$1" <<'PY'
+import sys, ipaddress
+arg = sys.argv[1]
+try:
+    net = ipaddress.ip_network(arg, strict=False)
+except ValueError:
+    print("INVALID INVALID")
+    sys.exit(0)
+print(str(net), net.version)
+PY
+}
+
+# Googlebot ranges cache
+TMP_JSON=""
+
+load_googlebot_json() {
+  [ -n "$TMP_JSON" ] && return 0
+  TMP_JSON="$(mktemp)"
+  trap 'rm -f "$TMP_JSON"' EXIT
+  curl -fsS https://developers.google.com/search/apis/ipranges/googlebot.json -o "$TMP_JSON" \
+    || { echo "Error: failed to download Googlebot IP ranges" >&2; exit 1; }
+}
+
+# Returns 0 if CIDR overlaps Googlebot ranges for given family (4 or 6)
+cidr_is_googlebot() {
+  local cidr="$1" fam="$2"
+  [ -n "$TMP_JSON" ] || load_googlebot_json
+  local ans
+  ans=$(
+    python3 - "$cidr" "$fam" "$TMP_JSON" <<'PY'
+import sys, json, ipaddress
+cidr = ipaddress.ip_network(sys.argv[1], strict=False)
+fam  = int(sys.argv[2])
+with open(sys.argv[3], 'r', encoding='utf-8') as fh:
+    data = json.load(fh)
+for p in data.get("prefixes", []):
+    key = "ipv4Prefix" if fam == 4 else "ipv6Prefix"
+    val = p.get(key)
+    if not val:
+        continue
+    if cidr.overlaps(ipaddress.ip_network(val)):
+        print("YES")
+        break
+else:
+    print("NO")
+PY
+  )
+  [ "$ans" = "YES" ]
+}
+
+# Insert DROP if missing
+ensure_drop_rule() {
+  local cidr="$1" fam="$2"
+  local ipt WAIT_FLAG=""
+  if [ "$fam" = "6" ]; then
+    ipt=$(find_cmd ip6tables) || { echo "Error: ip6tables not found" >&2; return 1; }
+  else
+    ipt=$(find_cmd iptables) || { echo "Error: iptables not found" >&2; return 1; }
+  fi
+  if "$ipt" -w -L >/dev/null 2>&1; then WAIT_FLAG="-w"; fi
+  if ! "$ipt" $WAIT_FLAG -C INPUT -s "$cidr" -j DROP 2>/dev/null; then
+    "$ipt" $WAIT_FLAG -I INPUT -s "$cidr" -j DROP
+    echo "Blocked IP range: $cidr via $ipt"
+    CHANGED=1
+  else
+    echo "Rule already present: $cidr via $ipt"
+  fi
+}
+
+# Delete all matching DROP rules for a CIDR on INPUT
+delete_block() {
+  local cidr="$1" fam="$2" ipt WAIT_FLAG=""
+  if [ "$fam" = "6" ]; then
+    ipt=$(find_cmd ip6tables) || { echo "Error: ip6tables not found" >&2; return 1; }
+  else
+    ipt=$(find_cmd iptables) || { echo "Error: iptables not found" >&2; return 1; }
+  fi
+  if "$ipt" -w -L >/dev/null 2>&1; then WAIT_FLAG="-w"; fi
+
+  local removed=0
+  while "$ipt" $WAIT_FLAG -C INPUT -s "$cidr" -j DROP 2>/dev/null; do
+    "$ipt" $WAIT_FLAG -D INPUT -s "$cidr" -j DROP
+    removed=$((removed+1))
+  done
+
+  if [ "$removed" -gt 0 ]; then
+    echo "Unblocked $cidr via $ipt, removed $removed rule(s)"
+    CHANGED=1
+  else
+    echo "No matching DROP rule found for $cidr on $ipt"
+  fi
+}
+
+# Autoblock: print "count ip" lines for offenders, one per line
+autoblock_candidates() {
+  local logpath="$1" minutes="$2" threshold="$3"
+  python3 - "$logpath" "$minutes" "$threshold" <<'PY'
+import sys, re
+from datetime import datetime, timezone, timedelta
+path, minutes, thr = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
+cutoff = datetime.now(timezone.utc) - timedelta(minutes=minutes)
+
+pat = re.compile(r'^(\S+).*?\[([^\]]+)\]')
+counts = {}
+with open(path, 'r', errors='ignore') as f:
+  for line in f:
+    m = pat.search(line)
+    if not m: 
+      continue
+    ip = m.group(1)
+    ts = m.group(2)  # e.g. 24/Aug/2025:14:34:22 +0000
+    try:
+      dt = datetime.strptime(ts, '%d/%b/%Y:%H:%M:%S %z')
+    except Exception:
+      continue
+    if dt >= cutoff:
+      counts[ip] = counts.get(ip, 0) + 1
+
+for ip, c in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])):
+  if c >= thr:
+    print(f"{c} {ip}")
+PY
+}
+
+if [ "$MODE" = "list" ]; then
+  list_blocked
+  exit 0
+fi
+
+if [ "$MODE" = "unblock" ]; then
+  if [ "${EUID:-$(id -u)}" -ne 0 ]; then
+    echo "Error: must be run as root" >&2
+    exit 1
+  fi
+  for arg in "$@"; do
+    read -r CIDR FAMILY <<<"$(normalize_cidr "$arg")"
+    if [ "$CIDR" = "INVALID" ]; then
+      echo "Error: invalid IP or CIDR: $arg" >&2
+      continue
+    fi
+    delete_block "$CIDR" "$FAMILY"
+  done
+  if [ "$CHANGED" -eq 1 ] && command -v netfilter-persistent >/dev/null 2>&1; then
+    netfilter-persistent save
+  fi
+  exit 0
+fi
+
+if [ "$MODE" = "autoblock" ]; then
+  [ -f "$ACCESS_LOG" ] || { echo "Error: access log not found at $ACCESS_LOG" >&2; exit 1; }
+
+  echo "Scanning $ACCESS_LOG for last $AB_MINUTES minute(s), threshold >= $AB_THRESHOLD"
+  offenders="$(autoblock_candidates "$ACCESS_LOG" "$AB_MINUTES" "$AB_THRESHOLD" || true)"
+  if [ -z "$offenders" ]; then
+    echo "No offenders found"
+    exit 0
+  fi
+
+  echo "Candidates:"
+  printf '  %s\n' $offenders | sed 's/^/  /' | sed 's/  / /'
+
+  if [ "$AB_DRY_RUN" -eq 1 ]; then
+    echo "(dry run) No changes made"
+    exit 0
+  fi
+
+  if [ "${EUID:-$(id -u)}" -ne 0 ]; then
+    echo "Error: must be run as root to block" >&2
+    exit 1
+  fi
+
+  load_googlebot_json
+
+  blocked=0 skipped=0
+  while read -r c ip; do
+    [ -z "$ip" ] && continue
+
+    if is_allowlisted_ip "$ip"; then
+      echo "Skip allowlisted: $ip ($c hits)"
+      skipped=$((skipped+1))
+      continue
+    fi
+
+    read -r CIDR FAMILY <<<"$(normalize_cidr "$ip")"
+    if [ "$CIDR" = "INVALID" ]; then
+      echo "Skip invalid: $ip"
+      skipped=$((skipped+1))
+      continue
+    fi
+
+    if cidr_is_googlebot "$CIDR" "$FAMILY"; then
+      echo "Skip Googlebot: $ip ($c hits)"
+      skipped=$((skipped+1))
+      continue
+    fi
+
+    ensure_drop_rule "$CIDR" "$FAMILY" || true
+    blocked=$((blocked+1))
+  done <<<"$offenders"
+
+  if [ "$CHANGED" -eq 1 ] && command -v netfilter-persistent >/dev/null 2>&1; then
+    netfilter-persistent save
+  fi
+
+  echo "Autoblock complete. Blocked: $blocked, Skipped: $skipped"
+  exit 0
+fi
+
+# Blocking mode from here on
+
+ARG="${ARG1:-}"
+[ -n "$ARG" ] || { echo "$USAGE" >&2; exit 1; }
+
+if [ "${EUID:-$(id -u)}" -ne 0 ]; then
+  echo "Error: must be run as root" >&2
+  exit 1
+fi
+
+read -r CIDR FAMILY <<EOF
+$(normalize_cidr "$ARG")
+EOF
+
+if [ "$CIDR" = "INVALID" ]; then
+  echo "Error: invalid IP or CIDR: $ARG" >&2
+  exit 1
+fi
+
+load_googlebot_json
+if cidr_is_googlebot "$CIDR" "$FAMILY"; then
+  echo "Range $CIDR overlaps Googlebot, skipping block"
+  exit 0
+fi
+
+ensure_drop_rule "$CIDR" "$FAMILY"
+
+if [ "$CHANGED" -eq 1 ] && command -v netfilter-persistent >/dev/null 2>&1; then
+  netfilter-persistent save
+fi
+
+
+
