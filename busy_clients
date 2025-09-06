@@ -4,6 +4,15 @@
 ROBOTS_FILE="/opt/bitnami/wordpress/robots.txt"
 ACCESS_LOG="/opt/bitnami/apache2/logs/access_log"
 
+# Optional: ipinfo token to raise rate limits, export IPINFO_TOKEN=xxxxxxxx
+IPINFO_TOKEN="${IPINFO_TOKEN:-}"
+
+# Simple cache to reduce external lookups
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/busy_clients"
+CACHE_FILE="$CACHE_DIR/ipinfo.tsv"
+mkdir -p "$CACHE_DIR"
+touch "$CACHE_FILE"
+
 # Check that required files exist
 if [ ! -f "$ROBOTS_FILE" ]; then
   echo "Error: robots.txt not found at $ROBOTS_FILE"
@@ -15,7 +24,7 @@ if [ ! -f "$ACCESS_LOG" ]; then
   exit 1
 fi
 
-# If a parameter is provided, use it for the number of days; otherwise default to 7
+# If a parameter is provided, use it for the number of days, otherwise default to 7
 DAYS_BACK=${1:-7}
 
 # Extract disallowed paths
@@ -79,18 +88,69 @@ awk '
   }
 ' "$TOT_COUNTS" "$VIO_COUNTS" > "$MERGED"
 
+# Lookup helper: returns "City, CC" or "(unknown)"
+lookup_geo() {
+  local ip="$1"
+  # Check cache
+  local cached
+  cached=$(awk -v ip="$ip" -F'\t' '$1==ip {print $2}' "$CACHE_FILE" | head -n1)
+  if [ -n "$cached" ]; then
+    printf "%s" "$cached"
+    return 0
+  fi
+
+  # Build URL
+  local url="https://ipinfo.io/${ip}"
+  if [ -n "$IPINFO_TOKEN" ]; then
+    url="${url}?token=${IPINFO_TOKEN}"
+  fi
+
+  # Query with short timeout and basic retry
+  local resp
+  resp=$(curl -m 4 --retry 1 --retry-delay 1 -sS "$url") || resp=""
+
+  # Parse JSON for city and country
+  local city country
+  if command -v jq >/dev/null 2>&1; then
+    city=$(printf '%s' "$resp" | jq -r '.city // empty')
+    country=$(printf '%s' "$resp" | jq -r '.country // empty')
+  else
+    # Fallback parser for simple key extraction
+    city=$(printf '%s' "$resp" | tr -d '\r' | grep -o '"city":[[:space:]]*"[^"]*"'    | head -1 | sed 's/.*"city":[[:space:]]*"\([^"]*\)".*/\1/')
+    country=$(printf '%s' "$resp" | tr -d '\r' | grep -o '"country":[[:space:]]*"[^"]*"' | head -1 | sed 's/.*"country":[[:space:]]*"\([^"]*\)".*/\1/')
+  fi
+
+  local out
+  if [ -n "$city" ] || [ -n "$country" ]; then
+    if [ -n "$city" ] && [ -n "$country" ]; then
+      out="${city}, ${country}"
+    elif [ -n "$country" ]; then
+      out="${country}"
+    else
+      out="${city}"
+    fi
+  else
+    out="(unknown)"
+  fi
+
+  # Cache result
+  printf "%s\t%s\n" "$ip" "$out" >> "$CACHE_FILE"
+  printf "%s" "$out"
+}
+
 # Output
 echo
 echo "=== Clients in the past $DAYS_BACK days (total vs disallowed) ==="
 # Use wider IP column for IPv6
-printf "%-39s %7s %11s   %s\n" "IP" "total" "disallowed" "hostname"
-printf "%-39s %7s %11s   %s\n" "---------------------------------------" "------" "-----------" "--------"
+printf "%-39s %7s %11s   %-24s %s\n" "IP" "total" "disallowed" "city,country" "hostname"
+printf "%-39s %7s %11s   %-24s %s\n" "---------------------------------------" "------" "-----------" "------------" "--------"
 
 # Sort by total requests descending, then IP
 sort -k2,2nr -k1,1 "$MERGED" | while read -r ip total disallowed; do
   hostname=$(host "$ip" 2>/dev/null | awk "/domain name pointer/ {print \$5}" | sed 's/\.$//')
   [ -z "$hostname" ] && hostname="(unresolved)"
-  printf "%-39s %7s %11s   %s\n" "$ip" "$total" "$disallowed" "$hostname"
+  geo="$(lookup_geo "$ip")"
+  printf "%-39s %7s %11s   %-24s %s\n" "$ip" "$total" "$disallowed" "$geo" "$hostname"
 done
 
 # Summary
@@ -101,4 +161,3 @@ if [ -s "$VIO_COUNTS" ]; then
 else
   echo "Unique IPs with disallowed accesses: 0"
 fi
-
