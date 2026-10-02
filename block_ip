@@ -1,13 +1,13 @@
-```bash
 #!/bin/bash
-# Block an IP or CIDR unless it overlaps official Googlebot prefixes.
+# Block an IP or CIDR unless it overlaps loopback, the allowlist, or official Googlebot prefixes.
+# Allowlist ($ALLOWLIST_FILE): one IP, CIDR, or rDNS glob (e.g. *.example.com) per line, # comments.
 # List current blocks, unblock ranges, and autoblock high-rate offenders.
 # Requires: curl, python3, iptables/ip6tables. Uses netfilter-persistent if present.
 
 set -euo pipefail
 
 USAGE=$'Usage:\n'\
-"  $0 <IP or CIDR>                  Block the address range unless it overlaps Googlebot\n"\
+"  $0 <IP or CIDR>                  Block the address range unless it is protected\n"\
 "  $0 --list [4|6]                  List DROP rules on INPUT with a source address, includes city,country for single IPs\n"\
 "  $0 --unblock <CIDR...>           Remove one or more blocked ranges\n"\
 "  $0 --autoblock <minutes> <N>     Block IPs with >= N requests in the last <minutes>\n"\
@@ -21,6 +21,8 @@ $'\nExamples:\n'\
 # Defaults
 ACCESS_LOG_DEFAULT="/opt/bitnami/apache2/logs/access_log"
 ALLOWLIST_FILE="${ALLOWLIST_FILE:-/etc/block_ip.allow}"
+# Never blocked, regardless of the allowlist file
+PROTECTED_CIDRS="127.0.0.0/8 ::1/128"
 
 # Optional: ipinfo token to raise rate limits, export IPINFO_TOKEN=xxxxxxxx
 IPINFO_TOKEN="${IPINFO_TOKEN:-}"
@@ -71,7 +73,11 @@ fi
 find_cmd() {
   local name="$1"
   local c
-  for c in "$name" "/usr/sbin/$name" "/sbin/$name"; do
+  if c=$(command -v "$name" 2>/dev/null); then
+    echo "$c"
+    return 0
+  fi
+  for c in "/usr/sbin/$name" "/sbin/$name"; do
     if [ -x "$c" ]; then
       echo "$c"
       return 0
@@ -96,29 +102,97 @@ ptr_name() {
   printf '%s' "$name"
 }
 
-# Return 0 if an IP is allowlisted by CIDR or rDNS glob in $ALLOWLIST_FILE
-is_allowlisted_ip() {
-  local ip="$1" host pat
-  [ -f "$ALLOWLIST_FILE" ] || return 1
-  host=$(ptr_name "$ip")
-  while IFS= read -r pat; do
-    pat="${pat%%#*}"
-    pat="${pat%"${pat##*[![:space:]]}"}"
-    [ -z "$pat" ] && continue
-    if [[ "$pat" == */* ]]; then
-      python3 - "$ip" "$pat" <<'PY'
+# All addresses a hostname resolves to, one per line
+forward_addrs() {
+  local name="$1"
+  if command -v getent >/dev/null 2>&1; then
+    getent ahosts "$name" 2>/dev/null | awk '{print $1}' | sort -u || true
+  elif command -v dig >/dev/null 2>&1; then
+    { dig +short A "$name"; dig +short AAAA "$name"; } 2>/dev/null | grep -v '\.$' || true
+  fi
+}
+
+# Reverse DNS name for an IP, only if that name resolves back to the same IP.
+# Without the forward check, whoever controls the IP's PTR record picks the name.
+verified_ptr_name() {
+  local ip="$1" name addrs
+  name=$(ptr_name "$ip")
+  [ "$name" = "(unresolved)" ] && return 1
+  addrs=$(forward_addrs "$name")
+  grep -qxF "$ip" <<< "$addrs" || return 1
+  printf '%s' "$name"
+}
+
+warn_if_no_allowlist() {
+  [ -f "$ALLOWLIST_FILE" ] \
+    || echo "Warning: allowlist $ALLOWLIST_FILE not found, only built-in and Googlebot protections apply" >&2
+}
+
+# Return 0 if a normalized CIDR must not be blocked, setting PROTECT_REASON.
+# Address entries in $ALLOWLIST_FILE (and $PROTECTED_CIDRS) protect any range
+# that overlaps them. Hostname globs are checked against forward-confirmed rDNS,
+# which only exists for a single address, so they never protect a wider range.
+PROTECT_REASON=""
+is_protected() {
+  local cidr="$1" fam="$2" out kind val host=""
+  PROTECT_REASON=""
+  out=$(
+    python3 - "$cidr" "$ALLOWLIST_FILE" $PROTECTED_CIDRS <<'PY'
 import sys, ipaddress
-ip = ipaddress.ip_address(sys.argv[1])
-net = ipaddress.ip_network(sys.argv[2], strict=False)
-sys.exit(0 if ip in net else 1)
+target = ipaddress.ip_network(sys.argv[1], strict=False)
+
+def overlaps(entry):
+    try:
+        net = ipaddress.ip_network(entry, strict=False)
+    except ValueError:
+        return None
+    return net.version == target.version and net.overlaps(target)
+
+for entry in sys.argv[3:]:
+    if overlaps(entry):
+        print(f"match\t{entry} (built-in)")
+        sys.exit(0)
+
+globs = []
+try:
+    with open(sys.argv[2], "r", encoding="utf-8") as fh:
+        for line in fh:
+            entry = line.split("#", 1)[0].strip()
+            if not entry:
+                continue
+            hit = overlaps(entry)
+            if hit:
+                print(f"match\t{entry}")
+                sys.exit(0)
+            if hit is None:
+                globs.append(entry)
+except FileNotFoundError:
+    pass
+for g in globs:
+    print(f"glob\t{g}")
 PY
-      [ $? -eq 0 ] && return 0
-    else
-      case "$host" in
-        $pat) return 0 ;;
-      esac
-    fi
-  done < "$ALLOWLIST_FILE"
+  ) || { echo "Error: allowlist check failed for $cidr" >&2; exit 1; }
+
+  while IFS=$'\t' read -r kind val; do
+    case "$kind" in
+      match)
+        PROTECT_REASON="allowlist entry $val"
+        return 0
+        ;;
+      glob)
+        if [ -z "$host" ]; then
+          { [ "$fam" = "4" ] && [[ "$cidr" == */32 ]]; } \
+            || { [ "$fam" = "6" ] && [[ "$cidr" == */128 ]]; } \
+            || return 1
+          host=$(verified_ptr_name "${cidr%/*}") || return 1
+          host="${host,,}"
+        fi
+        case "$host" in
+          ${val,,}) PROTECT_REASON="rDNS $host matches $val"; return 0 ;;
+        esac
+        ;;
+    esac
+  done <<< "$out"
   return 1
 }
 
@@ -135,6 +209,7 @@ lookup_geo() {
   if [ -n "$IPINFO_TOKEN" ]; then
     url="${url}?token=${IPINFO_TOKEN}"
   fi
+
   local resp city country out
   resp=$(curl -m 4 --retry 1 --retry-delay 1 -sS "$url") || resp=""
   if command -v jq >/dev/null 2>&1; then
@@ -253,10 +328,48 @@ TMP_JSON=""
 
 load_googlebot_json() {
   [ -n "$TMP_JSON" ] && return 0
+
   TMP_JSON="$(mktemp)"
   trap 'rm -f "$TMP_JSON"' EXIT
-  curl -fsS https://developers.google.com/search/apis/ipranges/googlebot.json -o "$TMP_JSON" \
-    || { echo "Error: failed to download Googlebot IP ranges" >&2; exit 1; }
+
+  if ! curl \
+    -fsSL \
+    --connect-timeout 5 \
+    --max-time 20 \
+    --retry 3 \
+    --retry-delay 1 \
+    https://developers.google.com/crawling/ipranges/common-crawlers.json \
+    -o "$TMP_JSON"; then
+    echo "Error: failed to download Googlebot IP ranges" >&2
+    exit 1
+  fi
+
+  if [ ! -s "$TMP_JSON" ]; then
+    echo "Error: Googlebot IP ranges response was empty" >&2
+    exit 1
+  fi
+
+  if ! python3 - "$TMP_JSON" <<'PY'
+import json
+import sys
+
+path = sys.argv[1]
+
+try:
+    with open(path, "r", encoding="utf-8") as fh:
+        data = json.load(fh)
+except (OSError, json.JSONDecodeError) as exc:
+    print(f"Invalid Googlebot JSON: {exc}", file=sys.stderr)
+    sys.exit(1)
+
+if not isinstance(data, dict) or not isinstance(data.get("prefixes"), list):
+    print("Invalid Googlebot JSON: missing prefixes array", file=sys.stderr)
+    sys.exit(1)
+PY
+  then
+    echo "Error: downloaded Googlebot IP ranges are invalid" >&2
+    exit 1
+  fi
 }
 
 # Returns 0 if CIDR overlaps Googlebot ranges for given family (4 or 6)
@@ -343,7 +456,7 @@ counts = {}
 with open(path, 'r', errors='ignore') as f:
   for line in f:
     m = pat.search(line)
-    if not m: 
+    if not m:
       continue
     ip = m.group(1)
     ts = m.group(2)  # e.g. 24/Aug/2025:14:34:22 +0000
@@ -407,21 +520,22 @@ if [ "$MODE" = "autoblock" ]; then
     exit 1
   fi
 
+  warn_if_no_allowlist
   load_googlebot_json
 
   blocked=0 skipped=0
   while read -r c ip; do
     [ -z "$ip" ] && continue
 
-    if is_allowlisted_ip "$ip"; then
-      echo "Skip allowlisted: $ip ($c hits)"
+    read -r CIDR FAMILY <<<"$(normalize_cidr "$ip")"
+    if [ "$CIDR" = "INVALID" ]; then
+      echo "Skip invalid: $ip"
       skipped=$((skipped+1))
       continue
     fi
 
-    read -r CIDR FAMILY <<<"$(normalize_cidr "$ip")"
-    if [ "$CIDR" = "INVALID" ]; then
-      echo "Skip invalid: $ip"
+    if is_protected "$CIDR" "$FAMILY"; then
+      echo "Skip protected: $ip ($c hits, $PROTECT_REASON)"
       skipped=$((skipped+1))
       continue
     fi
@@ -463,6 +577,12 @@ if [ "$CIDR" = "INVALID" ]; then
   exit 1
 fi
 
+warn_if_no_allowlist
+if is_protected "$CIDR" "$FAMILY"; then
+  echo "Range $CIDR is protected ($PROTECT_REASON), skipping block"
+  exit 0
+fi
+
 load_googlebot_json
 if cidr_is_googlebot "$CIDR" "$FAMILY"; then
   echo "Range $CIDR overlaps Googlebot, skipping block"
@@ -474,4 +594,5 @@ ensure_drop_rule "$CIDR" "$FAMILY"
 if [ "$CHANGED" -eq 1 ] && command -v netfilter-persistent >/dev/null 2>&1; then
   netfilter-persistent save
 fi
-```
+
+

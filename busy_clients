@@ -18,9 +18,15 @@ usage() {
   cat <<'EOF'
 busy_clients [--list [DAYS]] [DAYS]
 
-Without flags, prints a formatted table of IPs with totals, disallowed counts, city,country, and hostname.
+Without flags, prints a formatted table of IPs with totals, disallowed counts, blocked status,
+city,country, and hostname.
 --list prints a machine-friendly list with the same columns in a single line per IP.
-If DAYS is omitted, defaults to 7.
+If DAYS is omitted, defaults to 7. Rotated logs (access_log.1, access_log.2.gz, ...) are read too.
+
+disallowed: requests of any method to paths robots.txt disallows for "User-agent: *",
+            honoring Allow: lines and * / $ wildcards.
+blocked:    yes if an iptables/ip6tables DROP rule on INPUT covers the IP,
+            ? if the rules can't be read (run as root or with passwordless sudo).
 EOF
 }
 
@@ -45,6 +51,11 @@ case "$1" in
     ;;
 esac
 DAYS_BACK="${DAYS_BACK:-7}"
+if ! [[ "$DAYS_BACK" =~ ^[1-9][0-9]*$ ]]; then
+  echo "Error: DAYS must be a positive whole number, got: $DAYS_BACK" >&2
+  usage >&2
+  exit 1
+fi
 
 # Check that required files exist
 if [ ! -f "$ROBOTS_FILE" ]; then
@@ -57,72 +68,209 @@ if [ ! -f "$ACCESS_LOG" ]; then
   exit 1
 fi
 
-# Extract disallowed paths
-DISALLOWED_PATHS=$(grep -i '^[[:space:]]*Disallow:' "$ROBOTS_FILE" \
-  | awk '{print $2}' \
-  | sed 's|/$||' \
-  | sed '/^$/d' \
-  | sort -u)
-
-# Build a single regex for the last N days like 26/Aug/2025|25/Aug/2025|...
-DATE_PATTERN=$(
-  for i in $(seq 0 $((DAYS_BACK-1))); do
-    date -d "$i days ago" "+%d/%b/%Y"
-  done | paste -sd'|' -
-)
-
 # Temp files
-TEMP_ALL=$(mktemp)
-TEMP_VIOL=$(mktemp)
-TOT_COUNTS=$(mktemp)
-VIO_COUNTS=$(mktemp)
+BLOCKED=$(mktemp)
 MERGED=$(mktemp)
 
 # Ensure cleanup
 cleanup() {
-  rm -f "$TEMP_ALL" "$TEMP_VIOL" "$TOT_COUNTS" "$VIO_COUNTS" "$MERGED"
+  rm -f "$BLOCKED" "$MERGED"
 }
 trap cleanup EXIT
 
-# Collect all access log lines for the last N days
-grep -E "$DATE_PATTERN" "$ACCESS_LOG" > "$TEMP_ALL"
-
-# Collect only the lines that hit disallowed paths
-: > "$TEMP_VIOL"
-if [ -n "$DISALLOWED_PATHS" ]; then
-  for path in $DISALLOWED_PATHS; do
-    grep "\"GET ${path}" "$TEMP_ALL" >> "$TEMP_VIOL"
+# Resolve a binary even if not on PATH, trying common sbin locations
+find_cmd() {
+  local name="$1"
+  local c
+  if c=$(command -v "$name" 2>/dev/null); then
+    echo "$c"
+    return 0
+  fi
+  for c in "/usr/sbin/$name" "/sbin/$name"; do
+    if [ -x "$c" ]; then
+      echo "$c"
+      return 0
+    fi
   done
-fi
+  return 1
+}
 
-# Count total requests per IP
-awk '{print $1}' "$TEMP_ALL" | sort | uniq -c > "$TOT_COUNTS"
+# Write source CIDRs of DROP rules on INPUT (IPv4 and IPv6) to a file.
+# Returns 1 if either rule set can't be read.
+read_blocked() {
+  local out="$1" base cmd rules status=0
+  local -a run
+  : > "$out"
+  for base in iptables ip6tables; do
+    if ! cmd="$(find_cmd "$base")"; then
+      status=1
+      continue
+    fi
+    if [ "${EUID:-$(id -u)}" -ne 0 ] && command -v sudo >/dev/null 2>&1; then
+      run=(sudo -n "$cmd")
+    else
+      run=("$cmd")
+    fi
+    if ! rules=$("${run[@]}" -S INPUT 2>/dev/null); then
+      status=1
+      continue
+    fi
+    printf '%s\n' "$rules" | awk '
+      $1=="-A" && $2=="INPUT" {
+        src=""; drop=0
+        for (i=3; i<=NF; i++) {
+          if ($i=="-s" && i+1<=NF) src=$(i+1)
+          if ($i=="-j" && i+1<=NF && $(i+1)=="DROP") drop=1
+        }
+        if (drop && src!="") print src
+      }
+    ' >> "$out"
+  done
+  return $status
+}
 
-# Count disallowed requests per IP
-if [ -s "$TEMP_VIOL" ]; then
-  awk '{print $1}' "$TEMP_VIOL" | sort | uniq -c > "$VIO_COUNTS"
-else
-  : > "$VIO_COUNTS"
-fi
+BLOCKED_KNOWN=1
+read_blocked "$BLOCKED" || BLOCKED_KNOWN=0
 
-# Merge counts so that all clients appear, even if they have zero disallowed hits
-awk '
-  NR==FNR { tot[$2]=$1; next }
-  { viol[$2]=$1; next }
-  END {
-    for (ip in tot) {
-      v = (ip in viol) ? viol[ip] : 0
-      printf "%s %d %d\n", ip, tot[ip], v
-    }
-  }
-' "$TOT_COUNTS" "$VIO_COUNTS" > "$MERGED"
+# Count total and disallowed requests per IP for the last N days, one "ip total disallowed blocked" line per IP
+python3 - "$ACCESS_LOG" "$ROBOTS_FILE" "$DAYS_BACK" "$BLOCKED" "$BLOCKED_KNOWN" > "$MERGED" <<'PY'
+import functools, glob, gzip, ipaddress, os, re, sys
+from datetime import date, datetime, time, timedelta
 
-# Lookup helper: returns "City, CC" or "(unknown)"
+log_path, robots_path, days, blocked_path = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
+blocked_known = sys.argv[5] == "1"
+
+# robots.txt rules for "User-agent: *" (or every group if there is no * group),
+# as (pattern length, is_allow, regex)
+def load_rules(path):
+    groups, agents, rules, in_rules = [], [], [], False
+    with open(path, "r", encoding="utf-8", errors="ignore") as fh:
+        for line in fh:
+            line = line.split("#", 1)[0].strip()
+            if ":" not in line:
+                continue
+            key, val = (s.strip() for s in line.split(":", 1))
+            key = key.lower()
+            if key == "user-agent":
+                if in_rules:
+                    groups.append((agents, rules))
+                    agents, rules, in_rules = [], [], False
+                agents.append(val.lower())
+            elif key in ("allow", "disallow"):
+                in_rules = True
+                if val:  # an empty Disallow: means allow everything
+                    rules.append((key == "allow", val))
+    groups.append((agents, rules))
+
+    if any("*" in a for a, _ in groups):
+        chosen = [r for a, rs in groups if "*" in a for r in rs]
+    else:
+        chosen = [r for _, rs in groups for r in rs]
+
+    compiled = []
+    for allow, pat in chosen:
+        anchored = pat.endswith("$")
+        body = pat[:-1] if anchored else pat
+        rx = ".*".join(re.escape(part) for part in body.split("*")) + ("$" if anchored else "")
+        compiled.append((len(pat), allow, re.compile(rx)))
+    return compiled
+
+RULES = load_rules(robots_path)
+
+# Longest matching rule wins, Allow wins a tie (Google's robots.txt semantics)
+@functools.lru_cache(maxsize=200000)
+def is_disallowed(path):
+    best = None
+    for length, allow, rx in RULES:
+        if rx.match(path) and (best is None or length > best[0] or (length == best[0] and allow)):
+            best = (length, allow)
+    return best is not None and not best[1]
+
+# Today and the previous days-1 days, in Apache's dd/Mon/yyyy form
+first_day = date.today() - timedelta(days=days - 1)
+day_strings = {(first_day + timedelta(days=i)).strftime("%d/%b/%Y") for i in range(days)}
+window_start = datetime.combine(first_day, time.min).timestamp()
+
+# Current log plus rotated copies (access_log.1, access_log.2.gz, access_log-20250901, ...),
+# skipping any not written to since the window started
+files = [log_path] + sorted(glob.glob(glob.escape(log_path) + "[.-]*"))
+files = [f for f in files if os.path.isfile(f) and os.path.getmtime(f) >= window_start]
+
+line_re = re.compile(r'^(\S+) \S+ \S+ \[(\d{2}/\w{3}/\d{4}):[^\]]*\] "([^"]*)"')
+total, disallowed = {}, {}
+
+for f in files:
+    opener = gzip.open if f.endswith(".gz") else open
+    try:
+        with opener(f, "rt", errors="ignore") as fh:
+            for line in fh:
+                m = line_re.match(line)
+                if not m or m.group(2) not in day_strings:
+                    continue
+                ip = m.group(1)
+                total[ip] = total.get(ip, 0) + 1
+                request = m.group(3).split()
+                if len(request) >= 2 and is_disallowed(request[1]):
+                    disallowed[ip] = disallowed.get(ip, 0) + 1
+    except (OSError, EOFError) as exc:
+        print(f"Warning: could not fully read {f}: {exc}", file=sys.stderr)
+
+nets = []
+if blocked_known:
+    with open(blocked_path, "r", encoding="utf-8") as fh:
+        for line in fh:
+            try:
+                nets.append(ipaddress.ip_network(line.strip(), strict=False))
+            except ValueError:
+                pass
+
+def blocked_status(ip):
+    if not blocked_known:
+        return "?"
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return "no"
+    return "yes" if any(addr in n for n in nets) else "no"
+
+for ip, count in total.items():
+    print(ip, count, disallowed.get(ip, 0), blocked_status(ip))
+PY
+[ $? -eq 0 ] || { echo "Error: failed to process $ACCESS_LOG" >&2; exit 1; }
+
+# US state names, as ipinfo reports them in "region", to postal abbreviations
+declare -A US_STATE_ABBR=(
+  ["Alabama"]=AL ["Alaska"]=AK ["Arizona"]=AZ ["Arkansas"]=AR ["California"]=CA
+  ["Colorado"]=CO ["Connecticut"]=CT ["Delaware"]=DE ["Florida"]=FL ["Georgia"]=GA
+  ["Hawaii"]=HI ["Idaho"]=ID ["Illinois"]=IL ["Indiana"]=IN ["Iowa"]=IA
+  ["Kansas"]=KS ["Kentucky"]=KY ["Louisiana"]=LA ["Maine"]=ME ["Maryland"]=MD
+  ["Massachusetts"]=MA ["Michigan"]=MI ["Minnesota"]=MN ["Mississippi"]=MS ["Missouri"]=MO
+  ["Montana"]=MT ["Nebraska"]=NE ["Nevada"]=NV ["New Hampshire"]=NH ["New Jersey"]=NJ
+  ["New Mexico"]=NM ["New York"]=NY ["North Carolina"]=NC ["North Dakota"]=ND ["Ohio"]=OH
+  ["Oklahoma"]=OK ["Oregon"]=OR ["Pennsylvania"]=PA ["Rhode Island"]=RI ["South Carolina"]=SC
+  ["South Dakota"]=SD ["Tennessee"]=TN ["Texas"]=TX ["Utah"]=UT ["Vermont"]=VT
+  ["Virginia"]=VA ["Washington"]=WA ["West Virginia"]=WV ["Wisconsin"]=WI ["Wyoming"]=WY
+  ["District of Columbia"]=DC ["Washington, D.C."]=DC
+)
+
+# Extract a top-level string field from an ipinfo JSON response
+json_field() {
+  local resp="$1" key="$2"
+  if command -v jq >/dev/null 2>&1; then
+    printf '%s' "$resp" | jq -r ".${key} // empty" 2>/dev/null
+  else
+    printf '%s' "$resp" | tr -d '\r' | grep -o "\"${key}\":[[:space:]]*\"[^\"]*\"" | head -1 | sed "s/.*\"${key}\":[[:space:]]*\"\([^\"]*\)\".*/\1/"
+  fi
+}
+
+# Lookup helper: returns "City, ST, US" for US IPs, "City, CC" otherwise, or "(unknown)"
 lookup_geo() {
   local ip="$1"
   local cached
-  cached=$(awk -v ip="$ip" -F'\t' '$1==ip {print $2}' "$CACHE_FILE" | head -n1)
-  if [ -n "$cached" ]; then
+  # Newest entry wins, so a re-lookup below replaces an older cached value
+  cached=$(awk -v ip="$ip" -F'\t' '$1==ip {v=$2} END {print v}' "$CACHE_FILE")
+  # "City, US" entries predate the state column (block_ip still writes them), so look those up again
+  if [ -n "$cached" ] && ! [[ "$cached" =~ ^[^,]+,\ US$ ]]; then
     printf "%s" "$cached"
     return 0
   fi
@@ -131,17 +279,20 @@ lookup_geo() {
   if [ -n "$IPINFO_TOKEN" ]; then
     url="${url}?token=${IPINFO_TOKEN}"
   fi
+  # echo "LOOKING UP URL"
+  # echo ${url}
 
   local resp
   resp=$(curl -m 4 --retry 1 --retry-delay 1 -sS "$url") || resp=""
 
-  local city country
-  if command -v jq >/dev/null 2>&1; then
-    city=$(printf '%s' "$resp" | jq -r '.city // empty')
-    country=$(printf '%s' "$resp" | jq -r '.country // empty')
-  else
-    city=$(printf '%s' "$resp" | tr -d '\r' | grep -o '"city":[[:space:]]*"[^"]*"'    | head -1 | sed 's/.*"city":[[:space:]]*"\([^"]*\)".*/\1/')
-    country=$(printf '%s' "$resp" | tr -d '\r' | grep -o '"country":[[:space:]]*"[^"]*"' | head -1 | sed 's/.*"country":[[:space:]]*"\([^"]*\)".*/\1/')
+  local city region country
+  city=$(json_field "$resp" city)
+  region=$(json_field "$resp" region)
+  country=$(json_field "$resp" country)
+
+  # For US IPs, put the state between city and country
+  if [ "$country" = "US" ] && [ -n "$region" ]; then
+    country="${US_STATE_ABBR[$region]:-$region}, US"
   fi
 
   local out
@@ -153,6 +304,12 @@ lookup_geo() {
     out="${city}"
   else
     out="(unknown)"
+  fi
+
+  # Lookup failed, keep any older cached value rather than caching "(unknown)" over it
+  if [ "$out" = "(unknown)" ] && [ -n "$cached" ]; then
+    printf "%s" "$cached"
+    return 0
   fi
 
   printf "%s\t%s\n" "$ip" "$out" >> "$CACHE_FILE"
@@ -171,30 +328,30 @@ lookup_host() {
 # Output
 if [ "$MODE" = "list" ]; then
   # Machine friendly list, one line per IP, includes city,country
-  # Columns: ip total disallowed city,country hostname
-  sort -k2,2nr -k1,1 "$MERGED" | while read -r ip total disallowed; do
+  # Columns: ip total disallowed blocked city,country hostname
+  sort -k2,2nr -k1,1 "$MERGED" | while read -r ip total disallowed blocked; do
     geo="$(lookup_geo "$ip")"
     hostn="$(lookup_host "$ip")"
-    printf "%s\t%s\t%s\t%s\t%s\n" "$ip" "$total" "$disallowed" "$geo" "$hostn"
+    printf "%s\t%s\t%s\t%s\t%s\t%s\n" "$ip" "$total" "$disallowed" "$blocked" "$geo" "$hostn"
   done
   exit 0
 fi
 
 echo
 echo "=== Clients in the past $DAYS_BACK days (total vs disallowed) ==="
-printf "%-39s %7s %11s   %-24s %s\n" "IP" "total" "disallowed" "city,country" "hostname"
-printf "%-39s %7s %11s   %-24s %s\n" "---------------------------------------" "------" "-----------" "------------" "--------"
+printf "%-39s %7s %11s %8s   %-24s %s\n" "IP" "total" "disallowed" "blocked" "city,country" "hostname"
+printf "%-39s %7s %11s %8s   %-24s %s\n" "---------------------------------------" "------" "-----------" "-------" "------------" "--------"
 
-sort -k2,2nr -k1,1 "$MERGED" | while read -r ip total disallowed; do
+sort -k2,2nr -k1,1 "$MERGED" | while read -r ip total disallowed blocked; do
   hostname="$(lookup_host "$ip")"
   geo="$(lookup_geo "$ip")"
-  printf "%-39s %7s %11s   %-24s %s\n" "$ip" "$total" "$disallowed" "$geo" "$hostname"
+  printf "%-39s %7s %11s %8s   %-24s %s\n" "$ip" "$total" "$disallowed" "$blocked" "$geo" "$hostname"
 done
 
 echo
-echo "Total unique IPs: $(awk '{print $2}' "$TOT_COUNTS" | wc -l)"
-if [ -s "$VIO_COUNTS" ]; then
-  echo "Unique IPs with disallowed accesses: $(awk '{print $2}' "$VIO_COUNTS" | wc -l)"
-else
-  echo "Unique IPs with disallowed accesses: 0"
+echo "Total unique IPs: $(wc -l < "$MERGED")"
+echo "Unique IPs with disallowed accesses: $(awk '$3 > 0' "$MERGED" | wc -l)"
+if [ "$BLOCKED_KNOWN" -eq 0 ]; then
+  echo "Blocked status unknown ('?'): could not read iptables rules, run as root or with sudo"
 fi
+
