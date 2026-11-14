@@ -18,11 +18,13 @@ touch "$CACHE_FILE"
 # Usage helper
 usage() {
   cat <<'EOF'
-busy_clients [--list [DAYS]] [DAYS]
+busy_clients [--list] [--sort total|disallowed] [DAYS]
 
 Without flags, prints a formatted table of IPs with totals, disallowed counts, blocked status,
 city,country, and hostname.
 --list prints a machine-friendly list with the same columns in a single line per IP.
+--sort total sorts by total requests descending.
+--sort disallowed sorts by disallowed requests descending, then total descending (the default).
 If DAYS is omitted, defaults to 7. Rotated logs (access.log.1, access.log.2.gz, ...) are read too.
 The default log includes all hosts and redirects logged by this Nginx server.
 
@@ -49,6 +51,8 @@ EOF
 # Mode and days parsing
 MODE="table"
 DAYS_BACK=""
+SORT_BY="disallowed"
+while [ "$#" -gt 0 ]; do
 case "$1" in
   --help|-h)
     usage
@@ -56,16 +60,25 @@ case "$1" in
     ;;
   --list)
     MODE="list"
-    if [[ -n "$2" ]]; then
-      DAYS_BACK="$2"
+    ;;
+  --sort)
+    if [[ "${2:-}" != "total" && "${2:-}" != "disallowed" ]]; then
+      echo "Error: --sort requires total or disallowed" >&2
+      exit 1
     fi
+    SORT_BY="$2"
+    shift
     ;;
   *)
-    if [[ -n "$1" ]]; then
-      DAYS_BACK="$1"
+    if [[ -n "$DAYS_BACK" ]]; then
+      echo "Error: Unexpected argument: $1" >&2
+      exit 1
     fi
+    DAYS_BACK="$1"
     ;;
 esac
+shift
+done
 DAYS_BACK="${DAYS_BACK:-7}"
 if ! [[ "$DAYS_BACK" =~ ^[1-9][0-9]*$ ]]; then
   echo "Error: DAYS must be a positive whole number, got: $DAYS_BACK" >&2
@@ -370,11 +383,17 @@ lookup_host() {
   printf "%s" "$h"
 }
 
+# Sort both output formats using the same ordering, with IP as a stable final tie-breaker.
+SORT_KEYS=(-k2,2nr -k1,1)
+if [ "$SORT_BY" = "disallowed" ]; then
+  SORT_KEYS=(-k3,3nr -k2,2nr -k1,1)
+fi
+
 # Output
 if [ "$MODE" = "list" ]; then
   # Machine friendly list, one line per IP, includes city,country
   # Columns: ip total disallowed blocked city,country hostname
-  sort -k2,2nr -k1,1 "$MERGED" | while read -r ip total disallowed blocked; do
+  sort "${SORT_KEYS[@]}" "$MERGED" | while read -r ip total disallowed blocked; do
     geo="$(lookup_geo "$ip")"
     hostn="$(lookup_host "$ip")"
     printf "%s\t%s\t%s\t%s\t%s\t%s\n" "$ip" "$total" "$disallowed" "$blocked" "$geo" "$hostn"
@@ -387,7 +406,7 @@ echo "=== Clients in the past $DAYS_BACK days (total vs disallowed) ==="
 printf "%-39s %7s %11s %8s   %-24s %s\n" "IP" "total" "disallowed" "blocked" "city,country" "hostname"
 printf "%-39s %7s %11s %8s   %-24s %s\n" "---------------------------------------" "------" "-----------" "-------" "------------" "--------"
 
-sort -k2,2nr -k1,1 "$MERGED" | while read -r ip total disallowed blocked; do
+sort "${SORT_KEYS[@]}" "$MERGED" | while read -r ip total disallowed blocked; do
   hostname="$(lookup_host "$ip")"
   geo="$(lookup_geo "$ip")"
   printf "%-39s %7s %11s %8s   %-24s %s\n" "$ip" "$total" "$disallowed" "$blocked" "$geo" "$hostname"
