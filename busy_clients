@@ -5,6 +5,7 @@
 ROBOTS_FILE="${ROBOTS_FILE:-}"
 ROBOTS_URL="${ROBOTS_URL:-https://www.pianyc.net/robots.txt}"
 ACCESS_LOG="${ACCESS_LOG:-/var/log/nginx/access.log}"
+ALLOWLIST_FILE="${ALLOWLIST_FILE:-/etc/block_ip.allow}"
 
 # Optional: ipinfo token to raise rate limits, export IPINFO_TOKEN=xxxxxxxx
 IPINFO_TOKEN="${IPINFO_TOKEN:-}"
@@ -20,7 +21,7 @@ usage() {
   cat <<'EOF'
 busy_clients [--list] [--sort total|disallowed] [DAYS]
 
-Without flags, prints a formatted table of IPs with totals, disallowed counts, blocked status,
+Without flags, prints a formatted table of IPs with totals, disallowed counts, status,
 city,country, and hostname.
 --list prints a machine-friendly list with the same columns in a single line per IP.
 --sort total sorts by total requests descending.
@@ -35,13 +36,18 @@ Environment overrides:
   ROBOTS_URL   robots.txt URL fetched once per run when ROBOTS_FILE is not supplied.
                Default: https://www.pianyc.net/robots.txt
                Download requires HTTP 200 and a robots.txt User-agent directive.
+  ALLOWLIST_FILE  block_ip allowlist. Default: /etc/block_ip.allow
 
 disallowed: requests of any method to paths robots.txt disallows for "User-agent: *",
             honoring Allow: lines and * / $ wildcards.
-blocked:    yes if the IP matches the source CIDR of a DROP rule directly in the
-            iptables/ip6tables INPUT chain; no if no such match was found;
-            ? if either ruleset could not be read.
-            This is a source-rule match, not a complete effective-block check:
+status:     blocked if the IP matches a source CIDR in a direct INPUT DROP rule;
+            protected if it matches the block_ip allowlist, loopback, or official
+            Googlebot prefixes; open otherwise. An existing block takes precedence
+            over protection, because adding an exception does not remove a rule.
+            Hostname globs require forward-confirmed reverse DNS, as in block_ip.
+            Status requires readable IPv4/IPv6 rules and allowlist, and a valid
+            Googlebot feed; failures stop the report rather than showing open.
+            Firewall matching is not a complete effective-block check:
             rule order, extra match conditions, chain policies, other chains,
             native nftables rules, AWS rules and application blocks are not evaluated.
             Root or passwordless sudo may be needed to read these rules.
@@ -169,7 +175,7 @@ read_blocked() {
     else
       run=("$cmd")
     fi
-    if ! rules=$("${run[@]}" -S INPUT 2>/dev/null); then
+    if ! rules=$("${run[@]}" -w 5 -S INPUT 2>/dev/null); then
       status=1
       continue
     fi
@@ -187,16 +193,70 @@ read_blocked() {
   return $status
 }
 
-BLOCKED_KNOWN=1
-read_blocked "$BLOCKED" || BLOCKED_KNOWN=0
+if ! read_blocked "$BLOCKED"; then
+  echo "Error: cannot determine status: could not read both iptables/ip6tables INPUT rulesets; run with sudo or configure passwordless access" >&2
+  exit 1
+fi
 
-# Count total and disallowed requests per IP for the last N days, one "ip total disallowed blocked" line per IP
-python3 - "$ACCESS_LOG" "$ROBOTS_FILE" "$DAYS_BACK" "$BLOCKED" "$BLOCKED_KNOWN" > "$MERGED" <<'PY'
-import functools, glob, gzip, ipaddress, os, re, sys
+if [ ! -f "$ALLOWLIST_FILE" ] || [ ! -r "$ALLOWLIST_FILE" ]; then
+  echo "Error: cannot determine protection status: allowlist not found or unreadable at $ALLOWLIST_FILE" >&2
+  exit 1
+fi
+
+GOOGLEBOT_FILE="$WORK_DIR/googlebot.json"
+if ! curl --silent --show-error --fail --location --connect-timeout 5 --max-time 20 \
+    --proto '=https' --proto-redir '=https' --output "$GOOGLEBOT_FILE" \
+    https://developers.google.com/crawling/ipranges/common-crawlers.json; then
+  echo "Error: cannot determine protection status: could not download Googlebot prefixes" >&2
+  exit 1
+fi
+
+# Count requests and classify each IP using the same protection sources as block_ip.
+python3 - "$ACCESS_LOG" "$ROBOTS_FILE" "$DAYS_BACK" "$BLOCKED" "$ALLOWLIST_FILE" "$GOOGLEBOT_FILE" > "$MERGED" <<'PY'
+import fnmatch, functools, glob, gzip, ipaddress, json, os, re, subprocess, sys
 from datetime import date, datetime, time, timedelta
 
 log_path, robots_path, days, blocked_path = sys.argv[1], sys.argv[2], int(sys.argv[3]), sys.argv[4]
-blocked_known = sys.argv[5] == "1"
+allowlist_path, googlebot_path = sys.argv[5:7]
+
+def protection_sources():
+    protected = [ipaddress.ip_network('127.0.0.0/8'), ipaddress.ip_network('::1/128')]
+    hostname_globs = []
+    with open(allowlist_path, encoding='utf-8') as fh:
+        for line in fh:
+            entry = line.split('#', 1)[0].strip()
+            if not entry:
+                continue
+            try:
+                protected.append(ipaddress.ip_network(entry, strict=False))
+            except ValueError:
+                hostname_globs.append(entry.lower())
+    with open(googlebot_path, encoding='utf-8') as fh:
+        feed = json.load(fh)
+    if not isinstance(feed, dict) or not isinstance(feed.get('prefixes'), list) or not feed['prefixes']:
+        raise ValueError('missing or empty Googlebot prefixes array')
+    families = set()
+    for entry in feed['prefixes']:
+        if not isinstance(entry, dict):
+            raise ValueError('Googlebot prefix entry must be an object')
+        keys = [key for key in ('ipv4Prefix', 'ipv6Prefix') if key in entry]
+        if len(keys) != 1 or not isinstance(entry[keys[0]], str):
+            raise ValueError('Googlebot entry must contain one address prefix string')
+        key = keys[0]
+        net = ipaddress.ip_network(entry[key])
+        if net.version != (4 if key == 'ipv4Prefix' else 6):
+            raise ValueError('Googlebot prefix family does not match key')
+        protected.append(net)
+        families.add(net.version)
+    if families != {4, 6}:
+        raise ValueError('expected both IPv4 and IPv6 Googlebot prefixes')
+    return protected, hostname_globs
+
+try:
+    protected_nets, hostname_globs = protection_sources()
+except (OSError, ValueError) as exc:
+    print(f'Error: cannot determine protection status: {exc}', file=sys.stderr)
+    sys.exit(1)
 
 # robots.txt rules for "User-agent: *" (or every group if there is no * group),
 # as (pattern length, is_allow, regex)
@@ -265,7 +325,10 @@ for f in files:
                 m = line_re.match(line)
                 if not m or m.group(2) not in day_strings:
                     continue
-                ip = m.group(1)
+                try:
+                    ip = str(ipaddress.ip_address(m.group(1)))
+                except ValueError:
+                    continue
                 total[ip] = total.get(ip, 0) + 1
                 request = m.group(3).split()
                 if len(request) >= 2 and is_disallowed(request[1]):
@@ -273,26 +336,48 @@ for f in files:
     except (OSError, EOFError) as exc:
         print(f"Warning: could not fully read {f}: {exc}", file=sys.stderr)
 
-nets = []
-if blocked_known:
-    with open(blocked_path, "r", encoding="utf-8") as fh:
-        for line in fh:
-            try:
-                nets.append(ipaddress.ip_network(line.strip(), strict=False))
-            except ValueError:
-                pass
+with open(blocked_path, encoding='utf-8') as fh:
+    nets = [ipaddress.ip_network(line.strip(), strict=False) for line in fh if line.strip()]
 
-def blocked_status(ip):
-    if not blocked_known:
-        return "?"
-    try:
-        addr = ipaddress.ip_address(ip)
-    except ValueError:
-        return "no"
-    return "yes" if any(addr in n for n in nets) else "no"
+def verified_hostname(ip):
+    reverse = subprocess.run(['getent', 'hosts', ip], capture_output=True, text=True, timeout=5)
+    if reverse.returncode != 0 or not reverse.stdout.strip():
+        return None
+    fields = reverse.stdout.splitlines()[0].split()
+    if len(fields) < 2:
+        return None
+    name = fields[1].lower().rstrip('.')
+    forward = subprocess.run(['getent', 'ahosts', name], capture_output=True, text=True, timeout=5)
+    if forward.returncode != 0:
+        return None
+    target = ipaddress.ip_address(ip)
+    for line in forward.stdout.splitlines():
+        try:
+            if ipaddress.ip_address(line.split()[0]) == target:
+                return name
+        except (ValueError, IndexError):
+            pass
+    return None
 
-for ip, count in total.items():
-    print(ip, count, disallowed.get(ip, 0), blocked_status(ip))
+def client_status(ip):
+    addr = ipaddress.ip_address(ip)
+    # An allowlist exception prevents new blocks; it cannot override an old DROP.
+    if any(addr in n for n in nets):
+        return 'blocked'
+    if any(addr in n for n in protected_nets):
+        return 'protected'
+    if hostname_globs:
+        name = verified_hostname(ip)
+        if name and any(fnmatch.fnmatchcase(name, pattern) for pattern in hostname_globs):
+            return 'protected'
+    return 'open'
+
+try:
+    for ip, count in total.items():
+        print(ip, count, disallowed.get(ip, 0), client_status(ip))
+except (OSError, subprocess.TimeoutExpired) as exc:
+    print(f'Error: cannot verify hostname protection: {exc}', file=sys.stderr)
+    sys.exit(1)
 PY
 [ $? -eq 0 ] || { echo "Error: failed to process $ACCESS_LOG" >&2; exit 1; }
 
@@ -392,31 +477,28 @@ fi
 # Output
 if [ "$MODE" = "list" ]; then
   # Machine friendly list, one line per IP, includes city,country
-  # Columns: ip total disallowed blocked city,country hostname
-  sort "${SORT_KEYS[@]}" "$MERGED" | while read -r ip total disallowed blocked; do
+  # Columns: ip total disallowed status city,country hostname
+  sort "${SORT_KEYS[@]}" "$MERGED" | while read -r ip total disallowed status; do
     geo="$(lookup_geo "$ip")"
     hostn="$(lookup_host "$ip")"
-    printf "%s\t%s\t%s\t%s\t%s\t%s\n" "$ip" "$total" "$disallowed" "$blocked" "$geo" "$hostn"
+    printf "%s\t%s\t%s\t%s\t%s\t%s\n" "$ip" "$total" "$disallowed" "$status" "$geo" "$hostn"
   done
   exit 0
 fi
 
 echo
 echo "=== Clients in the past $DAYS_BACK days (total vs disallowed) ==="
-printf "%-39s %7s %11s %8s   %-24s %s\n" "IP" "total" "disallowed" "blocked" "city,country" "hostname"
-printf "%-39s %7s %11s %8s   %-24s %s\n" "---------------------------------------" "------" "-----------" "-------" "------------" "--------"
+printf "%-39s %7s %11s %9s   %-24s %s\n" "IP" "total" "disallowed" "status" "city,country" "hostname"
+printf "%-39s %7s %11s %9s   %-24s %s\n" "---------------------------------------" "------" "-----------" "---------" "------------" "--------"
 
-sort "${SORT_KEYS[@]}" "$MERGED" | while read -r ip total disallowed blocked; do
+sort "${SORT_KEYS[@]}" "$MERGED" | while read -r ip total disallowed status; do
   hostname="$(lookup_host "$ip")"
   geo="$(lookup_geo "$ip")"
-  printf "%-39s %7s %11s %8s   %-24s %s\n" "$ip" "$total" "$disallowed" "$blocked" "$geo" "$hostname"
+  printf "%-39s %7s %11s %9s   %-24s %s\n" "$ip" "$total" "$disallowed" "$status" "$geo" "$hostname"
 done
 
 echo
 echo "Total unique IPs: $(wc -l < "$MERGED")"
 echo "Unique IPs with disallowed accesses: $(awk '$3 > 0' "$MERGED" | wc -l)"
-echo "Blocked column: source matches in direct INPUT DROP rules only; see --help for limits."
-if [ "$BLOCKED_KNOWN" -eq 0 ]; then
-  echo "Blocked status unknown ('?'): could not read both iptables/ip6tables rulesets; root or passwordless sudo may be needed"
-fi
+echo "Status: blocked takes precedence over protected, then open; see --help for matching limits."
 
