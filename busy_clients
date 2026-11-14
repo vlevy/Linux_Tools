@@ -1,8 +1,10 @@
 #!/bin/bash
 
-# Override these paths through the environment; retain the original Apache defaults.
-ROBOTS_FILE="${ROBOTS_FILE:-/opt/bitnami/wordpress/robots.txt}"
-ACCESS_LOG="${ACCESS_LOG:-/opt/bitnami/apache2/logs/access_log}"
+# Override the Nginx log path and robots source through the environment.
+# A supplied local ROBOTS_FILE takes precedence over downloading ROBOTS_URL.
+ROBOTS_FILE="${ROBOTS_FILE:-}"
+ROBOTS_URL="${ROBOTS_URL:-https://www.pianyc.net/robots.txt}"
+ACCESS_LOG="${ACCESS_LOG:-/var/log/nginx/access.log}"
 
 # Optional: ipinfo token to raise rate limits, export IPINFO_TOKEN=xxxxxxxx
 IPINFO_TOKEN="${IPINFO_TOKEN:-}"
@@ -21,13 +23,16 @@ busy_clients [--list [DAYS]] [DAYS]
 Without flags, prints a formatted table of IPs with totals, disallowed counts, blocked status,
 city,country, and hostname.
 --list prints a machine-friendly list with the same columns in a single line per IP.
-If DAYS is omitted, defaults to 7. Rotated logs (access_log.1, access_log.2.gz, ...) are read too.
+If DAYS is omitted, defaults to 7. Rotated logs (access.log.1, access.log.2.gz, ...) are read too.
+The default log includes all hosts and redirects logged by this Nginx server.
 
 Environment overrides:
   ACCESS_LOG   Current access-log file (rotated copies are discovered automatically).
-               Default: /opt/bitnami/apache2/logs/access_log
-  ROBOTS_FILE  Local robots.txt file.
-               Default: /opt/bitnami/wordpress/robots.txt
+               Default: /var/log/nginx/access.log
+  ROBOTS_FILE  Optional local robots.txt file, used instead of downloading ROBOTS_URL.
+  ROBOTS_URL   robots.txt URL fetched once per run when ROBOTS_FILE is not supplied.
+               Default: https://www.pianyc.net/robots.txt
+               Download requires HTTP 200 and a robots.txt User-agent directive.
 
 disallowed: requests of any method to paths robots.txt disallows for "User-agent: *",
             honoring Allow: lines and * / $ wildcards.
@@ -68,26 +73,55 @@ if ! [[ "$DAYS_BACK" =~ ^[1-9][0-9]*$ ]]; then
   exit 1
 fi
 
-# Check that required files exist
-if [ ! -f "$ROBOTS_FILE" ]; then
-  echo "Error: robots.txt not found at $ROBOTS_FILE"
+# Check the log before downloading robots.txt.
+if [ ! -f "$ACCESS_LOG" ] || [ ! -r "$ACCESS_LOG" ]; then
+  echo "Error: Access log not found or not readable at $ACCESS_LOG" >&2
   exit 1
 fi
 
-if [ ! -f "$ACCESS_LOG" ]; then
-  echo "Error: Access log not found at $ACCESS_LOG"
-  exit 1
-fi
-
-# Temp files
-BLOCKED=$(mktemp)
-MERGED=$(mktemp)
+# Keep downloaded rules and intermediate files private and remove them on exit.
+WORK_DIR=$(mktemp -d) || exit 1
+BLOCKED="$WORK_DIR/blocked"
+MERGED="$WORK_DIR/merged"
 
 # Ensure cleanup
 cleanup() {
-  rm -f "$BLOCKED" "$MERGED"
+  rm -rf -- "$WORK_DIR"
 }
 trap cleanup EXIT
+
+if [ -n "$ROBOTS_FILE" ]; then
+  if [ ! -f "$ROBOTS_FILE" ] || [ ! -r "$ROBOTS_FILE" ]; then
+    echo "Error: robots.txt not found or not readable at $ROBOTS_FILE" >&2
+    exit 1
+  fi
+else
+  ROBOTS_FILE="$WORK_DIR/robots.txt"
+  if ! robots_status=$(curl --silent --show-error --fail --location \
+      --proto '=http,https' --proto-redir '=http,https' \
+      --connect-timeout 5 --max-time 20 --max-redirs 5 \
+      --output "$ROBOTS_FILE" --write-out '%{http_code}' "$ROBOTS_URL"); then
+    echo "Error: Could not download robots.txt from $ROBOTS_URL" >&2
+    exit 1
+  fi
+  if [ "$robots_status" != "200" ]; then
+    echo "Error: robots.txt download returned HTTP $robots_status (expected 200)" >&2
+    exit 1
+  fi
+  # Reject HTML/error pages rather than silently counting every request as allowed.
+  if ! python3 - "$ROBOTS_FILE" <<'PY'
+import re, sys
+from pathlib import Path
+text = Path(sys.argv[1]).read_text(encoding="utf-8-sig", errors="replace")
+if "<html" in text.lower() or "<!doctype html" in text.lower():
+    sys.exit(1)
+sys.exit(0 if re.search(r"^\s*user-agent\s*:\s*[^\s#]+", text, re.I | re.M) else 1)
+PY
+  then
+    echo "Error: Downloaded robots.txt is not a recognized robots file (expected a User-agent directive)" >&2
+    exit 1
+  fi
+fi
 
 # Resolve a binary even if not on PATH, trying common sbin locations
 find_cmd() {
@@ -197,7 +231,7 @@ def is_disallowed(path):
             best = (length, allow)
     return best is not None and not best[1]
 
-# Today and the previous days-1 days, in Apache's dd/Mon/yyyy form
+# Today and the previous days-1 days, in combined-log dd/Mon/yyyy form
 first_day = date.today() - timedelta(days=days - 1)
 day_strings = {(first_day + timedelta(days=i)).strftime("%d/%b/%Y") for i in range(days)}
 window_start = datetime.combine(first_day, time.min).timestamp()
