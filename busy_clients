@@ -1,8 +1,8 @@
 #!/bin/bash
 
-# Set paths
-ROBOTS_FILE="/opt/bitnami/wordpress/robots.txt"
-ACCESS_LOG="/opt/bitnami/apache2/logs/access_log"
+# Override these paths through the environment; retain the original Apache defaults.
+ROBOTS_FILE="${ROBOTS_FILE:-/opt/bitnami/wordpress/robots.txt}"
+ACCESS_LOG="${ACCESS_LOG:-/opt/bitnami/apache2/logs/access_log}"
 
 # Optional: ipinfo token to raise rate limits, export IPINFO_TOKEN=xxxxxxxx
 IPINFO_TOKEN="${IPINFO_TOKEN:-}"
@@ -23,10 +23,21 @@ city,country, and hostname.
 --list prints a machine-friendly list with the same columns in a single line per IP.
 If DAYS is omitted, defaults to 7. Rotated logs (access_log.1, access_log.2.gz, ...) are read too.
 
+Environment overrides:
+  ACCESS_LOG   Current access-log file (rotated copies are discovered automatically).
+               Default: /opt/bitnami/apache2/logs/access_log
+  ROBOTS_FILE  Local robots.txt file.
+               Default: /opt/bitnami/wordpress/robots.txt
+
 disallowed: requests of any method to paths robots.txt disallows for "User-agent: *",
             honoring Allow: lines and * / $ wildcards.
-blocked:    yes if an iptables/ip6tables DROP rule on INPUT covers the IP,
-            ? if the rules can't be read (run as root or with passwordless sudo).
+blocked:    yes if the IP matches the source CIDR of a DROP rule directly in the
+            iptables/ip6tables INPUT chain; no if no such match was found;
+            ? if either ruleset could not be read.
+            This is a source-rule match, not a complete effective-block check:
+            rule order, extra match conditions, chain policies, other chains,
+            native nftables rules, AWS rules and application blocks are not evaluated.
+            Root or passwordless sudo may be needed to read these rules.
 EOF
 }
 
@@ -351,7 +362,8 @@ done
 echo
 echo "Total unique IPs: $(wc -l < "$MERGED")"
 echo "Unique IPs with disallowed accesses: $(awk '$3 > 0' "$MERGED" | wc -l)"
+echo "Blocked column: source matches in direct INPUT DROP rules only; see --help for limits."
 if [ "$BLOCKED_KNOWN" -eq 0 ]; then
-  echo "Blocked status unknown ('?'): could not read iptables rules, run as root or with sudo"
+  echo "Blocked status unknown ('?'): could not read both iptables/ip6tables rulesets; root or passwordless sudo may be needed"
 fi
 
