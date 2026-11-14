@@ -3,23 +3,36 @@
 # Allowlist ($ALLOWLIST_FILE): one IP, CIDR, or rDNS glob (e.g. *.example.com) per line, # comments.
 # List current blocks, unblock ranges, and autoblock high-rate offenders.
 # Requires: curl, python3, iptables/ip6tables. Uses netfilter-persistent if present.
+# Manual blocks affect all services; autoblock defaults to TCP ports 80 and 443.
 
 set -euo pipefail
 
-USAGE=$'Usage:\n'\
-"  $0 <IP or CIDR>                  Block the address range unless it is protected\n"\
-"  $0 --list [4|6]                  List DROP rules on INPUT with a source address, includes city,country for single IPs\n"\
-"  $0 --unblock <CIDR...>           Remove one or more blocked ranges\n"\
-"  $0 --autoblock <minutes> <N>     Block IPs with >= N requests in the last <minutes>\n"\
-"       [--dry-run] [--log <path>]\n"\
-$'\nExamples:\n'\
-"  $0 203.0.113.0/24\n"\
-"  $0 --list\n"\
-"  $0 --unblock 34.174.0.0/16 47.82.11.0/24\n"\
-"  $0 --autoblock 10 300 --dry-run\n"
+USAGE="Usage:
+  $0 <IP or CIDR>                  Block the address range unless it is protected
+  $0 --list [4|6]                  List source DROP rules on INPUT, with their scope
+  $0 --unblock <CIDR...>           Remove one or more blocked ranges
+  $0 --autoblock <minutes> <N>     Block IPs with >= N requests in the last <minutes>
+       [--dry-run] [--log <path>] [--all-ports]
+  $0 --help                       Show this help
+
+Manual blocks affect ALL services, including SSH and databases.
+Autoblock affects TCP 80/443; --all-ports explicitly selects all services.
+Existing whole-source blocks remain in force until unblocked.
+--unblock removes both whole-source and TCP 80/443 blocks for the exact CIDR.
+ACCESS_LOG overrides the default log; rotated numbered/date logs are included.
+Dry-run checks allowlist and Googlebot protections (requires the crawler feed).
+Rules are saved with netfilter-persistent when available; otherwise a warning
+reports that this tool has not saved the changes for reboot.
+
+Examples:
+  $0 203.0.113.0/24
+  $0 --list
+  $0 --unblock 34.174.0.0/16 47.82.11.0/24
+  $0 --autoblock 10 300 --dry-run
+"
 
 # Defaults
-ACCESS_LOG_DEFAULT="/opt/bitnami/apache2/logs/access_log"
+ACCESS_LOG_DEFAULT="${ACCESS_LOG:-/opt/bitnami/apache2/logs/access_log}"
 ALLOWLIST_FILE="${ALLOWLIST_FILE:-/etc/block_ip.allow}"
 # Never blocked, regardless of the allowlist file
 PROTECTED_CIDRS="127.0.0.0/8 ::1/128"
@@ -30,17 +43,17 @@ IPINFO_TOKEN="${IPINFO_TOKEN:-}"
 # Simple cache for IP geolocation lookups
 CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/busy_clients"
 CACHE_FILE="$CACHE_DIR/ipinfo.tsv"
-mkdir -p "$CACHE_DIR"
-touch "$CACHE_FILE"
 
 MODE="block"
 FAMILY_LIST="all"
 CHANGED=0
+RULE_SCOPE="all"
 
 ARG1="${1:-}"
 ARG2="${2:-}"
 
 if [ "${ARG1:-}" = "--list" ] || [ "${ARG1:-}" = "-l" ]; then
+  [ "$#" -le 2 ] || { echo "$USAGE" >&2; exit 1; }
   MODE="list"
   case "${ARG2:-all}" in
     4|v4|ipv4) FAMILY_LIST="4" ;;
@@ -57,16 +70,25 @@ elif [ "${ARG1:-}" = "--autoblock" ]; then
   shift
   [ "$#" -ge 2 ] || { echo "$USAGE" >&2; exit 1; }
   AB_MINUTES="$1"; AB_THRESHOLD="$2"; shift 2
+  [[ "$AB_MINUTES" =~ ^[0-9]+$ && "$AB_MINUTES" =~ [1-9] && "$AB_THRESHOLD" =~ ^[0-9]+$ && "$AB_THRESHOLD" =~ [1-9] ]] \
+    || { echo "Error: minutes and threshold must be positive integers" >&2; exit 1; }
   AB_DRY_RUN=0
+  RULE_SCOPE="web"
   ACCESS_LOG="$ACCESS_LOG_DEFAULT"
   while [ "$#" -gt 0 ]; do
     case "$1" in
       --dry-run) AB_DRY_RUN=1 ;;
+      --all-ports) RULE_SCOPE="all" ;;
       --log) shift; ACCESS_LOG="${1:-}"; [ -n "$ACCESS_LOG" ] || { echo "Error: --log requires a path" >&2; exit 1; } ;;
       *) echo "Error: unknown flag for --autoblock: $1" >&2; echo "$USAGE" >&2; exit 1 ;;
     esac
     shift || true
   done
+elif [ "${ARG1:-}" = "--help" ] || [ "${ARG1:-}" = "-h" ]; then
+  echo "$USAGE"
+  exit 0
+else
+  [ "$#" -eq 1 ] || { echo "$USAGE" >&2; exit 1; }
 fi
 
 # Resolve a binary even if not on PATH, trying common sbin locations
@@ -90,13 +112,13 @@ find_cmd() {
 ptr_name() {
   local ip="$1" name=""
   if command -v host >/dev/null 2>&1; then
-    name=$(host "$ip" 2>/dev/null | awk '/domain name pointer/ {print $5}' | sed 's/\.$//' | head -n1)
+    name=$(host "$ip" 2>/dev/null | awk '/domain name pointer/ {print $5}' | sed 's/\.$//' | head -n1) || name=""
   fi
   if [ -z "$name" ] && command -v getent >/dev/null 2>&1; then
-    name=$(getent hosts "$ip" 2>/dev/null | awk '{print $2}' | head -n1)
+    name=$(getent hosts "$ip" 2>/dev/null | awk '{print $2}' | head -n1) || name=""
   fi
   if [ -z "$name" ] && command -v dig >/dev/null 2>&1; then
-    name=$(dig +short -x "$ip" 2>/dev/null | sed 's/\.$//' | head -n1)
+    name=$(dig +short -x "$ip" 2>/dev/null | sed 's/\.$//' | head -n1) || name=""
   fi
   [ -z "$name" ] && name="(unresolved)"
   printf '%s' "$name"
@@ -119,7 +141,18 @@ verified_ptr_name() {
   name=$(ptr_name "$ip")
   [ "$name" = "(unresolved)" ] && return 1
   addrs=$(forward_addrs "$name")
-  grep -qxF "$ip" <<< "$addrs" || return 1
+  # Compare addresses semantically (IPv6 has multiple equivalent spellings).
+  python3 - "$ip" "$addrs" <<'PY' || return 1
+import ipaddress, sys
+target = ipaddress.ip_address(sys.argv[1])
+for item in sys.argv[2].splitlines():
+    try:
+        if ipaddress.ip_address(item) == target:
+            sys.exit(0)
+    except ValueError:
+        pass
+sys.exit(1)
+PY
   printf '%s' "$name"
 }
 
@@ -200,7 +233,7 @@ PY
 lookup_geo() {
   local ip="$1"
   local cached
-  cached=$(awk -v ip="$ip" -F'\t' '$1==ip {print $2}' "$CACHE_FILE" | head -n1)
+  cached=$(awk -v ip="$ip" -F'\t' '$1==ip {print $2; exit}' "$CACHE_FILE" 2>/dev/null) || cached=""
   if [ -n "$cached" ]; then
     printf "%s" "$cached"
     return 0
@@ -210,25 +243,26 @@ lookup_geo() {
     url="${url}?token=${IPINFO_TOKEN}"
   fi
 
-  local resp city country out
+  local resp out
   resp=$(curl -m 4 --retry 1 --retry-delay 1 -sS "$url") || resp=""
-  if command -v jq >/dev/null 2>&1; then
-    city=$(printf '%s' "$resp" | jq -r '.city // empty')
-    country=$(printf '%s' "$resp" | jq -r '.country // empty')
-  else
-    city=$(printf '%s' "$resp" | tr -d '\r' | grep -o '"city":[[:space:]]*"[^"]*"'    | head -1 | sed 's/.*"city":[[:space:]]*"\([^"]*\)".*/\1/')
-    country=$(printf '%s' "$resp" | tr -d '\r' | grep -o '"country":[[:space:]]*"[^"]*"' | head -1 | sed 's/.*"country":[[:space:]]*"\([^"]*\)".*/\1/')
+  out=$(python3 - "$resp" <<'PY'
+import json, sys
+try:
+    data = json.loads(sys.argv[1])
+    values = [data.get(key) for key in ('city', 'country')]
+    print(', '.join(' '.join(v.split()) for v in values if isinstance(v, str) and v.strip()))
+except (ValueError, AttributeError):
+    pass
+PY
+  ) || out=""
+  # Lookup failures must not prevent listing firewall rules or poison the cache.
+  if [ -z "$out" ]; then
+    printf '%s' '(unknown)'
+    return 0
   fi
-  if [ -n "$city" ] && [ -n "$country" ]; then
-    out="${city}, ${country}"
-  elif [ -n "$country" ]; then
-    out="${country}"
-  elif [ -n "$city" ]; then
-    out="${city}"
-  else
-    out="(unknown)"
+  if mkdir -p "$CACHE_DIR" && touch "$CACHE_FILE"; then
+    printf "%s\t%s\n" "$ip" "$out" >> "$CACHE_FILE" || true
   fi
-  printf "%s\t%s\n" "$ip" "$out" >> "$CACHE_FILE"
   printf "%s" "$out"
 }
 
@@ -241,8 +275,8 @@ list_family() {
   echo "$label"
 
   if ! cmd="$(find_cmd "$base")"; then
-    echo "  ($base not found, ensure /usr/sbin and /sbin are in PATH)"
-    return 0
+    echo "Error: $base not found, ensure /usr/sbin and /sbin are in PATH" >&2
+    return 1
   fi
 
   if [ "${EUID:-$(id -u)}" -ne 0 ] && command -v sudo >/dev/null 2>&1; then
@@ -251,20 +285,23 @@ list_family() {
     run=("$cmd")
   fi
 
-  local lines
+  local lines rules
+  rules=$("${run[@]}" -w 5 -S INPUT) || {
+    echo "Error: cannot read $base INPUT rules (try sudo)" >&2
+    return 1
+  }
   lines=$(
-    "${run[@]}" -S INPUT 2>/dev/null \
-      | awk '
+    awk '
           $1=="-A" && $2=="INPUT" {
-            src=""; drop=0
+            src=""; drop=0; scope=""
             for (i=3; i<=NF; i++) {
-              if ($i=="-s" && i+1<=NF) src=$(i+1)
-              if ($i=="-j" && i+1<=NF && $(i+1)=="DROP") drop=1
+              if ($i=="-s" && i+1<=NF) {src=$(++i); continue}
+              if ($i=="-j" && i+1<=NF && $(i+1)=="DROP") {drop=1; i++; continue}
+              scope=scope (scope=="" ? "" : " ") $i
             }
-            if (drop && src!="") print src
+            if (drop && src!="") print src "\t" (scope=="" ? "all traffic" : scope)
           }
-        ' \
-      | sort -u || true
+        ' <<< "$rules" | sort -u
   )
 
   width=22
@@ -273,9 +310,10 @@ list_family() {
   if [ -n "${lines:-}" ]; then
     local count=0
     # Header
-    printf "  %-*s   %-*s %s\n" "$width" "CIDR" "$geo_width" "city,country" "hostname"
+    printf "  %-*s   %-*s %-30s %s\n" "$width" "CIDR" "$geo_width" "city,country" "hostname" "rule scope (additional matches)"
     printf "  %-*s   %-*s %s\n" "$width" "$(printf '%0.s-' $(seq 1 $width))" "$geo_width" "$(printf '%0.s-' $(seq 1 $geo_width))" "$(printf '%0.s-' $(seq 1 16))"
-    while IFS= read -r cidr; do
+    local cidr scope
+    while IFS=$'\t' read -r cidr scope; do
       [ -z "$cidr" ] && continue
       local hostcol="" geocol="(range)"
       if [ "$base" = "iptables" ] && [[ "$cidr" == */32 ]]; then
@@ -287,16 +325,12 @@ list_family() {
         hostcol=$(ptr_name "$ip6")
         geocol=$(lookup_geo "$ip6")
       fi
-      printf "  %-*s   %-*s %s\n" "$width" "$cidr" "$geo_width" "$geocol" "$hostcol"
+      printf "  %-*s   %-*s %-30s %s\n" "$width" "$cidr" "$geo_width" "$geocol" "$hostcol" "$scope"
       count=$((count+1))
     done <<< "$lines"
     echo "  -- total: $count"
   else
-    if "${run[@]}" -L INPUT -n 1>/dev/null 2>&1; then
-      echo "  (none)"
-    else
-      echo "  (cannot read rules, try running with sudo)"
-    fi
+    echo "  (none)"
   fi
 }
 
@@ -351,6 +385,7 @@ load_googlebot_json() {
 
   if ! python3 - "$TMP_JSON" <<'PY'
 import json
+import ipaddress
 import sys
 
 path = sys.argv[1]
@@ -362,8 +397,28 @@ except (OSError, json.JSONDecodeError) as exc:
     print(f"Invalid Googlebot JSON: {exc}", file=sys.stderr)
     sys.exit(1)
 
-if not isinstance(data, dict) or not isinstance(data.get("prefixes"), list):
-    print("Invalid Googlebot JSON: missing prefixes array", file=sys.stderr)
+try:
+    if not isinstance(data, dict) or not isinstance(data.get("prefixes"), list) or not data['prefixes']:
+        raise ValueError('missing or empty prefixes array')
+    families = set()
+    for entry in data['prefixes']:
+        if not isinstance(entry, dict):
+            raise ValueError('prefix entry must be an object')
+        keys = [key for key in ('ipv4Prefix', 'ipv6Prefix') if key in entry]
+        if len(keys) != 1:
+            raise ValueError('entry must contain exactly one address prefix')
+        key = keys[0]
+        value = entry[key]
+        if not isinstance(value, str):
+            raise ValueError('prefix must be a string')
+        net = ipaddress.ip_network(value)
+        if net.version != (4 if key == 'ipv4Prefix' else 6):
+            raise ValueError('prefix family does not match its key')
+        families.add(net.version)
+    if families != {4, 6}:
+        raise ValueError('expected both IPv4 and IPv6 protection ranges')
+except ValueError as exc:
+    print(f'Invalid Googlebot JSON: {exc}', file=sys.stderr)
     sys.exit(1)
 PY
   then
@@ -395,50 +450,96 @@ for p in data.get("prefixes", []):
 else:
     print("NO")
 PY
-  )
+  ) || { echo "Error: Googlebot protection check failed for $cidr" >&2; return 2; }
   [ "$ans" = "YES" ]
 }
 
-# Insert DROP if missing
-ensure_drop_rule() {
-  local cidr="$1" fam="$2"
-  local ipt WAIT_FLAG=""
-  if [ "$fam" = "6" ]; then
-    ipt=$(find_cmd ip6tables) || { echo "Error: ip6tables not found" >&2; return 1; }
-  else
-    ipt=$(find_cmd iptables) || { echo "Error: iptables not found" >&2; return 1; }
+# Build the exact rule shared by insertion and removal.
+rule_args() {
+  RULE_ARGS=(-s "$1")
+  if [ "$2" = "web" ]; then
+    RULE_ARGS+=(-p tcp -m multiport --dports 80,443)
   fi
-  if "$ipt" -w -L >/dev/null 2>&1; then WAIT_FLAG="-w"; fi
-  if ! "$ipt" $WAIT_FLAG -C INPUT -s "$cidr" -j DROP 2>/dev/null; then
-    "$ipt" $WAIT_FLAG -I INPUT -s "$cidr" -j DROP
-    echo "Blocked IP range: $cidr via $ipt"
-    CHANGED=1
+  RULE_ARGS+=(-j DROP)
+}
+
+firewall_cmd() {
+  local base=iptables
+  [ "$1" = "6" ] && base=ip6tables
+  IPT=$(find_cmd "$base") || { echo "Error: $base not found" >&2; return 1; }
+  # A failed -C alone cannot distinguish missing rules from an unreadable chain.
+  "$IPT" -w 5 -S INPUT >/dev/null || { echo "Error: cannot read $base INPUT chain" >&2; return 1; }
+}
+
+# Return 0 if present, 1 if absent, 2 on a firewall error.
+rule_exists() {
+  local status
+  if "$IPT" -w 5 -C INPUT "${RULE_ARGS[@]}" 2>/dev/null; then
+    return 0
   else
-    echo "Rule already present: $cidr via $ipt"
+    status=$?
+    [ "$status" -eq 1 ] && return 1
+    echo "Error: firewall rule check failed (exit $status)" >&2
+    return 2
   fi
 }
 
-# Delete all matching DROP rules for a CIDR on INPUT
-delete_block() {
-  local cidr="$1" fam="$2" ipt WAIT_FLAG=""
-  if [ "$fam" = "6" ]; then
-    ipt=$(find_cmd ip6tables) || { echo "Error: ip6tables not found" >&2; return 1; }
+# Insert DROP if missing; explicitly handle errors even when called in an if.
+ensure_drop_rule() {
+  local cidr="$1" fam="$2"
+  RULE_ADDED=0
+  firewall_cmd "$fam" || return 1
+  rule_args "$cidr" "$RULE_SCOPE"
+  if rule_exists; then
+    echo "Rule already present: $cidr ($RULE_SCOPE) via $IPT"
+    return 0
   else
-    ipt=$(find_cmd iptables) || { echo "Error: iptables not found" >&2; return 1; }
+    [ "$?" -eq 1 ] || return 1
   fi
-  if "$ipt" -w -L >/dev/null 2>&1; then WAIT_FLAG="-w"; fi
-
-  local removed=0
-  while "$ipt" $WAIT_FLAG -C INPUT -s "$cidr" -j DROP 2>/dev/null; do
-    "$ipt" $WAIT_FLAG -D INPUT -s "$cidr" -j DROP
-    removed=$((removed+1))
-  done
-
-  if [ "$removed" -gt 0 ]; then
-    echo "Unblocked $cidr via $ipt, removed $removed rule(s)"
+  if "$IPT" -w 5 -I INPUT "${RULE_ARGS[@]}"; then
+    echo "Blocked IP range: $cidr ($RULE_SCOPE) via $IPT"
     CHANGED=1
+    RULE_ADDED=1
   else
-    echo "No matching DROP rule found for $cidr on $ipt"
+    echo "Error: failed to block $cidr" >&2
+    return 1
+  fi
+}
+
+# Delete exact whole-source and web-only rules, including duplicates.
+delete_block() {
+  local cidr="$1" fam="$2" scope removed=0
+  firewall_cmd "$fam" || return 1
+  for scope in all web; do
+    rule_args "$cidr" "$scope"
+    while true; do
+      if rule_exists; then
+        if ! "$IPT" -w 5 -D INPUT "${RULE_ARGS[@]}"; then
+          echo "Error: failed to remove $cidr ($scope); removed $removed rule(s) so far" >&2
+          return 1
+        fi
+        CHANGED=1
+        removed=$((removed+1))
+      else
+        [ "$?" -eq 1 ] || return 1
+        break
+      fi
+    done
+  done
+  if [ "$removed" -gt 0 ]; then
+    echo "Unblocked $cidr via $IPT, removed $removed rule(s)"
+  else
+    echo "No matching DROP rule found for $cidr on $IPT"
+  fi
+}
+
+save_changes() {
+  [ "$CHANGED" -eq 1 ] || return 0
+  local saver
+  if saver=$(find_cmd netfilter-persistent); then
+    "$saver" save || { echo "Error: live rules changed but saving them failed" >&2; return 1; }
+  else
+    echo "Warning: live rules changed but netfilter-persistent is unavailable; this tool has not saved them for reboot" >&2
   fi
 }
 
@@ -446,26 +547,46 @@ delete_block() {
 autoblock_candidates() {
   local logpath="$1" minutes="$2" threshold="$3"
   python3 - "$logpath" "$minutes" "$threshold" <<'PY'
-import sys, re
+import sys, re, glob, gzip, ipaddress, os
 from datetime import datetime, timezone, timedelta
 path, minutes, thr = sys.argv[1], int(sys.argv[2]), int(sys.argv[3])
-cutoff = datetime.now(timezone.utc) - timedelta(minutes=minutes)
+now = datetime.now(timezone.utc)
+try:
+    cutoff = now - timedelta(minutes=minutes)
+except OverflowError:
+    print('Error: minutes exceeds the supported time range', file=sys.stderr)
+    sys.exit(1)
 
 pat = re.compile(r'^(\S+).*?\[([^\]]+)\]')
-counts = {}
-with open(path, 'r', errors='ignore') as f:
-  for line in f:
-    m = pat.search(line)
-    if not m:
-      continue
-    ip = m.group(1)
-    ts = m.group(2)  # e.g. 24/Aug/2025:14:34:22 +0000
-    try:
-      dt = datetime.strptime(ts, '%d/%b/%Y:%H:%M:%S %z')
-    except Exception:
-      continue
-    if dt >= cutoff:
-      counts[ip] = counts.get(ip, 0) + 1
+counts, seen = {}, set()
+rotation = re.compile(r'(?:\.\d+|-\d{8}(?:-\d{6})?)(?:\.gz)?$')
+paths = [path] + sorted(p for p in glob.glob(glob.escape(path) + '*')
+                        if rotation.fullmatch(p[len(path):]))
+try:
+    for filename in paths:
+        stat = os.stat(filename)
+        identity = (stat.st_dev, stat.st_ino)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        if filename != path and stat.st_mtime < cutoff.timestamp():
+            continue
+        opener = gzip.open if filename.endswith('.gz') else open
+        with opener(filename, 'rt', errors='replace') as f:
+            for line in f:
+                m = pat.search(line)
+                if not m:
+                    continue
+                try:
+                    ip = str(ipaddress.ip_address(m.group(1)))
+                    dt = datetime.strptime(m.group(2), '%d/%b/%Y:%H:%M:%S %z')
+                except ValueError:
+                    continue
+                if cutoff <= dt <= now:
+                    counts[ip] = counts.get(ip, 0) + 1
+except (OSError, EOFError) as exc:
+    print(f'Error: cannot scan access logs: {exc}', file=sys.stderr)
+    sys.exit(1)
 
 for ip, c in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])):
   if c >= thr:
@@ -483,39 +604,34 @@ if [ "$MODE" = "unblock" ]; then
     echo "Error: must be run as root" >&2
     exit 1
   fi
+  failed=0
   for arg in "$@"; do
     read -r CIDR FAMILY <<<"$(normalize_cidr "$arg")"
     if [ "$CIDR" = "INVALID" ]; then
       echo "Error: invalid IP or CIDR: $arg" >&2
+      failed=1
       continue
     fi
-    delete_block "$CIDR" "$FAMILY"
+    delete_block "$CIDR" "$FAMILY" || failed=1
   done
-  if [ "$CHANGED" -eq 1 ] && command -v netfilter-persistent >/dev/null 2>&1; then
-    netfilter-persistent save
-  fi
-  exit 0
+  save_changes || failed=1
+  exit "$failed"
 fi
 
 if [ "$MODE" = "autoblock" ]; then
   [ -f "$ACCESS_LOG" ] || { echo "Error: access log not found at $ACCESS_LOG" >&2; exit 1; }
 
   echo "Scanning $ACCESS_LOG for last $AB_MINUTES minute(s), threshold >= $AB_THRESHOLD"
-  offenders="$(autoblock_candidates "$ACCESS_LOG" "$AB_MINUTES" "$AB_THRESHOLD" || true)"
+  offenders="$(autoblock_candidates "$ACCESS_LOG" "$AB_MINUTES" "$AB_THRESHOLD")" || exit 1
   if [ -z "$offenders" ]; then
     echo "No offenders found"
     exit 0
   fi
 
   echo "Candidates:"
-  printf '  %s\n' $offenders | sed 's/^/  /' | sed 's/  / /'
+  while read -r c ip; do printf '  %s %s\n' "$c" "$ip"; done <<< "$offenders"
 
-  if [ "$AB_DRY_RUN" -eq 1 ]; then
-    echo "(dry run) No changes made"
-    exit 0
-  fi
-
-  if [ "${EUID:-$(id -u)}" -ne 0 ]; then
+  if [ "$AB_DRY_RUN" -eq 0 ] && [ "${EUID:-$(id -u)}" -ne 0 ]; then
     echo "Error: must be run as root to block" >&2
     exit 1
   fi
@@ -523,7 +639,8 @@ if [ "$MODE" = "autoblock" ]; then
   warn_if_no_allowlist
   load_googlebot_json
 
-  blocked=0 skipped=0
+  # Finish every protection check before applying any changes.
+  planned=() skipped=0
   while read -r c ip; do
     [ -z "$ip" ] && continue
 
@@ -544,18 +661,39 @@ if [ "$MODE" = "autoblock" ]; then
       echo "Skip Googlebot: $ip ($c hits)"
       skipped=$((skipped+1))
       continue
+    else
+      [ "$?" -eq 1 ] || exit 1
     fi
 
-    ensure_drop_rule "$CIDR" "$FAMILY" || true
-    blocked=$((blocked+1))
+    planned+=("$CIDR $FAMILY")
+    if [ "$AB_DRY_RUN" -eq 1 ]; then
+      echo "Would block: $ip ($c hits, scope: $RULE_SCOPE)"
+    fi
   done <<<"$offenders"
 
-  if [ "$CHANGED" -eq 1 ] && command -v netfilter-persistent >/dev/null 2>&1; then
-    netfilter-persistent save
+  if [ "$AB_DRY_RUN" -eq 1 ]; then
+    echo "(dry run) Would block: ${#planned[@]}, Skipped: $skipped. No firewall changes made"
+    exit 0
   fi
 
-  echo "Autoblock complete. Blocked: $blocked, Skipped: $skipped"
-  exit 0
+  blocked=0 existing=0 failed=0
+  for candidate in "${planned[@]}"; do
+    read -r CIDR FAMILY <<< "$candidate"
+    if ensure_drop_rule "$CIDR" "$FAMILY"; then
+      if [ "$RULE_ADDED" -eq 1 ]; then
+        blocked=$((blocked+1))
+      else
+        existing=$((existing+1))
+      fi
+    else
+      failed=$((failed+1))
+    fi
+  done
+  result=0
+  [ "$failed" -eq 0 ] || result=1
+  save_changes || result=1
+  echo "Autoblock complete. Blocked: $blocked, Already present: $existing, Skipped: $skipped, Failed: $failed"
+  exit "$result"
 fi
 
 # Blocking mode from here on
@@ -587,12 +725,12 @@ load_googlebot_json
 if cidr_is_googlebot "$CIDR" "$FAMILY"; then
   echo "Range $CIDR overlaps Googlebot, skipping block"
   exit 0
+else
+  [ "$?" -eq 1 ] || exit 1
 fi
 
 ensure_drop_rule "$CIDR" "$FAMILY"
 
-if [ "$CHANGED" -eq 1 ] && command -v netfilter-persistent >/dev/null 2>&1; then
-  netfilter-persistent save
-fi
+save_changes
 
 
