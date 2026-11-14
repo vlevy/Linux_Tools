@@ -129,8 +129,23 @@ class BlockIPTests(unittest.TestCase):
         return f'{ip} - - [{stamp}] "GET / HTTP/1.1" 200 123 "-" "fixture"\n'
 
     def run_tool(self, *args, **env):
-        return subprocess.run(['bash', str(self.script), *args], env={**self.env, **env},
-                              capture_output=True, text=True, timeout=10)
+        result = subprocess.run(['bash', str(self.script), *args], env={**self.env, **env},
+                                capture_output=True, text=True, timeout=10)
+        # Every exit path prints exactly one timing footer, including failures.
+        self.assertRegex(result.stdout, r'Elapsed time: \d+m \d+s\n\Z')
+        self.assertEqual(result.stdout.count('Elapsed time:'), 1)
+        return result
+
+    def test_timing_preserves_exit_status_and_temporary_file_cleanup(self):
+        self.log.write_text(self.line())
+        p = self.run_tool('--help', TMP_JSON=str(self.log))
+        self.assertEqual(p.returncode, 0)
+        self.assertTrue(self.log.exists())
+        for failure in ('0', '1'):
+            with self.subTest(download_failure=failure):
+                p = self.auto('--dry-run', TMPDIR=str(self.root), CURL_FAIL=failure)
+                self.assertEqual(p.returncode, int(failure))
+                self.assertEqual(list(self.root.glob('tmp.*')), [])
 
     def auto(self, *args, **env):
         return self.run_tool('--autoblock', '10', '1', *args, **env)

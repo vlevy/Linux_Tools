@@ -7,6 +7,18 @@
 
 set -euo pipefail
 
+BLOCK_IP_START_SECONDS=$SECONDS
+TMP_JSON=""
+finish() {
+  local status=$? elapsed=$((SECONDS - BLOCK_IP_START_SECONDS))
+  if [ -n "${TMP_JSON:-}" ]; then
+    rm -f -- "$TMP_JSON" || true
+  fi
+  printf 'Elapsed time: %dm %ds\n' "$((elapsed / 60))" "$((elapsed % 60))"
+  exit "$status"
+}
+trap finish EXIT
+
 USAGE="Usage:
   $0 <IP or CIDR>                  Block the address range unless it is protected
   $0 --list [4|6]                  List source DROP rules on INPUT, with their scope
@@ -360,13 +372,10 @@ PY
 }
 
 # Googlebot ranges cache
-TMP_JSON=""
-
 load_googlebot_json() {
   [ -n "$TMP_JSON" ] && return 0
 
   TMP_JSON="$(mktemp)"
-  trap 'rm -f "$TMP_JSON"' EXIT
 
   if ! curl \
     -fsSL \
