@@ -20,6 +20,8 @@ Autoblock affects TCP 80/443; --all-ports explicitly selects all services.
 Existing whole-source blocks remain in force until unblocked.
 --unblock removes both whole-source and TCP 80/443 blocks for the exact CIDR.
 ACCESS_LOG overrides the default log; rotated numbered/date logs are included.
+Default: /var/log/nginx/access.log (all hosts and redirects logged there).
+The parser accepts the standard combined access-log format.
 Dry-run checks allowlist and Googlebot protections (requires the crawler feed).
 Rules are saved with netfilter-persistent when available; otherwise a warning
 reports that this tool has not saved the changes for reboot.
@@ -32,7 +34,7 @@ Examples:
 "
 
 # Defaults
-ACCESS_LOG_DEFAULT="${ACCESS_LOG:-/opt/bitnami/apache2/logs/access_log}"
+ACCESS_LOG_DEFAULT="${ACCESS_LOG:-/var/log/nginx/access.log}"
 ALLOWLIST_FILE="${ALLOWLIST_FILE:-/etc/block_ip.allow}"
 # Never blocked, regardless of the allowlist file
 PROTECTED_CIDRS="127.0.0.0/8 ::1/128"
